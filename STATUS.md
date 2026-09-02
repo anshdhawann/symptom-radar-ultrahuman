@@ -18,7 +18,7 @@ privacy-preserving alternative to commercial symptom-radar products.
 | Retrospective evaluation on months of real data | `evaluate.py`: 14 flags, 11 true positives, 3 false positives, **4% FPR** |
 | Oura comparison (honest, vs published TemPredict numbers) | `BENCHMARK.md` |
 | Labeling infrastructure (fine/rough/sick) | `--label` CLI, MCP tools, `labels.py` |
-| Label collection automation | nightly cron (asks today's status AND retrospective dates) |
+| Label collection automation | nightly cron (asks today's status, reports progress) |
 | Classification + verification | `train.py` (pure-stdlib logistic, leave-one-out, honest verdicts) |
 | Sensitivity analysis | `scenario.py` (hypotheses A/B/C for unconfirmed episodes) |
 | End-to-end pipeline proof | dry-run on scratch DB: from-memory → status → train → evaluate all work |
@@ -40,18 +40,31 @@ privacy-preserving alternative to commercial symptom-radar products.
 
 The sick-vs-strain separation requires **labeled days**. `train.py` gates at
 15 sick + 15 rough. **Labels must not be fabricated** — that would corrupt the
-evaluation worse than missing data. The bottleneck is a human input that has
-been requested through every channel (plain text, structured questions, nightly
-cron probing). The single most valuable input is the wearer's memory of the
-strongest unconfirmed episodes — `scenario.py` proves the stakes: if those were
-**sick** (hypothesis A), the classifier reaches 0.50-0.67 recall / 0.50-0.60
-precision TODAY. If they were **rough**, it stays at 0 until real illness adds
-sick labels.
+evaluation worse than missing data.
 
-## Exactly what to run when labels arrive
+The retrospective route is **closed**: the wearer no longer remembers the
+strongest unconfirmed episodes, and the nightly check-in no longer asks about
+them. `scenario.py` documented the stakes at the time: if those episodes were
+**sick** (hypothesis A), the classifier reached 0.50-0.67 recall / 0.50-0.60
+precision; if **rough**, it stayed at 0 until real illness added sick labels.
+Those hypotheses are no longer testable — collection is forward-only.
+
+## The path forward (forward-only collection)
+
+Realistic pace from the wearer's history (3 sick days in ~3 months, most in
+one episode): reaching 15 sick labels by nightly check-ins alone is likely a
+**12+ month** wait. Rough labels arrive faster (~1.7/month → 10 more ≈ 6
+months). The honest verdict: measured sick-vs-alcohol separation will not
+exist until real sick episodes accumulate AND are labeled as they happen.
+
+Until then, the engine still ships the practical value: strain flags with
+11 true positives / 3 false positives / 4% FPR, and BENCHMARK.md's honest
+Oura comparison stands.
+
+## If the wearer ever remembers a past episode
 
 ```bash
-# One sentence, natural language:
+# One sentence, natural language — any remembered episode:
 python3 labels.py --from-memory "Jan 15 sick, Feb 18 sick, Mar 26-27 rough"
 # (or per-day: python3 symptom_radar.py --label sick --label-date YYYY-MM-DD)
 # 'don't remember' is also a valid, honest answer.
@@ -66,6 +79,8 @@ and `train.py` gives the validated verdict.
 
 ## Automatic collection (no action needed)
 
-- Nightly cron: asks today's fine/rough/sick AND retrospective dates; logs via
-  `--label` / `--from-memory`; reports progress.
+- Nightly check-in: asks today's fine/rough/sick; logs via `--label`;
+  reports progress; auto-runs the verify chain once 15/15 is reached.
+- Retrospective probing is retired (the wearer doesn't recall the old
+  episodes); collection is forward-only.
 - Progress checkable anytime: `python3 labels.py --status`.

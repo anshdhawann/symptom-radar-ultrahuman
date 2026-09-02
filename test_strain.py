@@ -150,11 +150,14 @@ def test_temp_elevated_is_flagged():
         "temp_deviation": 1.2,  # +1.2°C
         "recovery_index": 70,
     }
-    # Flat baseline → std is ~0 → z is None → no score. This documents that
-    # behavior: a single anomalous day against a perfectly flat baseline is
-    # NOT flagged because there's no variance to compare against.
+    # A perfectly flat baseline (std=0, MAD=0 — e.g. a stuck sensor) used to
+    # SILENCE the metric: z undefined → metric skipped, and a fever-grade
+    # +1.2°C spike went completely unflagged. MIN_NOISE floors σ (temp
+    # 0.05°C) so the metric stays alive and the spike IS caught. Single-day
+    # spike → level 1 (Significant needs 2+ elevated days, by design).
     level, detail = sr.assess_strain(base + [today])
-    assert level == 0
+    assert level == 1
+    assert "Temp" in detail
 
 def test_insufficient_history():
     level, detail = sr.assess_strain([{"night_rhr": 60}] * 5)
@@ -182,6 +185,17 @@ def test_slope_ignores_none():
     # Gaps shouldn't distort the fitted rate.
     s = sr.linear_slope([58, None, 60, None, 62])
     assert s > 0 and abs(s - 1.0) < 1e-6
+
+def test_slope_dates_prevent_gap_compression():
+    # Values rise 0.1 per CALENDAR day, but Jul 26 has no row at all.
+    # Index-based x compresses the 3-day span into 2 steps → slope 0.15;
+    # calendar-dated x preserves the true rate of 0.10/day.
+    vals = [0.1, 0.2, 0.4]
+    dates = ["2026-07-24", "2026-07-25", "2026-07-27"]
+    assert abs(sr.linear_slope(vals) - 0.15) < 1e-9
+    assert abs(sr.linear_slope(vals, dates) - 0.10) < 1e-9
+    # Unparseable dates fall back to index spacing without raising.
+    assert abs(sr.linear_slope(vals, ["bad", None, "2026-07-27"]) - 0.15) < 1e-9
 
 
 # ─── MAD / robust noise ───────────────────────────────────────────────────────
@@ -462,16 +476,19 @@ def test_logistic_truthful_on_non_separable():
 # ─── Retrospective label parser (labels.py --from-memory) ───────────────────
 def test_bulk_from_memory_parses_and_dedupes():
     """'Jan 15 sick, Feb 18 sick, Mar 26-27 rough' must produce exactly 4
-    labels with no duplicates (Jun 26 expanded from both 'Jun 26' and the
-    '26-27' range previously)."""
+    labels with no duplicates (Mar 26 expanded from both 'Mar 26' and the
+    '26-27' range previously). Month-day tokens resolve to the CURRENT
+    year (dynamic since the 2027 rollover fix)."""
     import labels, tempfile, os
+    from datetime import datetime
+    yr = datetime.now().year
     with tempfile.TemporaryDirectory() as td:
         old = sr.DB_PATH
         try:
             sr.DB_PATH = os.path.join(td, "t.db")
             out = labels.bulk_from_memory("Jan 15 sick, Feb 18 sick, Mar 26-27 rough")
             dates = [d for d, _ in out]
-            assert dates == ["2024-01-15", "2024-02-18", "2024-03-26", "2024-03-27"], dates
+            assert dates == [f"{yr}-01-15", f"{yr}-02-18", f"{yr}-03-26", f"{yr}-03-27"], dates
             assert len(out) == 4, f"expected 4, got {len(out)}: {out}"
         finally:
             sr.DB_PATH = old

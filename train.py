@@ -95,7 +95,10 @@ def extract_features(history, today_idx):
     return feats
 
 
-# Feature order (must stay stable across calls)
+# Feature order (must stay stable across calls).
+# NOTE: rec_rebound uses NEXT-day recovery (today_idx + 1) — it is offline-only.
+# This trainer is a retrospective diagnostic; a real-time morning alert must
+# drop rec_rebound (scenario.py showed core-only features score about the same).
 FEATURE_ORDER = ["strain_idx", "elevated_3d", "rec_decline",
                  "rhr_z", "hrv_z", "temp_z", "sleep_z", "rec_rebound"]
 
@@ -285,7 +288,6 @@ def main():
         print("   Keep collecting. The recovery-curve shape (hangovers rebound")
         print("   in 1 day, illness persists 2-3) may need a dedicated feature.")
         verdict = "not_separable"
-    return verdict
     print()
     print("Per-day predictions (highest strain first):")
     for (date, lbl, feats), (pred, true) in sorted(
@@ -294,6 +296,7 @@ def main():
         print(f"  {date}  actual={lbl:<6} pred={'sick' if pred else 'rough':<6} "
               f"{mark}  strain={feats['strain_idx']:.2f} "
               f"elev={feats['elevated_3d']}/3 rec↓={int(feats['rec_decline'])}")
+    return verdict
 
 
 if __name__ == "__main__":

@@ -316,14 +316,41 @@ def median_abs_deviation(series):
         return None
     return _median(devs)
 
-def linear_slope(series):
-    """Least-squares slope of a series over time (units per day index).
+def linear_slope(series, dates=None):
+    """Least-squares slope of a series over time (units per day).
 
-    None values are dropped; the slope is fit on whatever points remain,
-    spaced by their original index (so gaps don't distort the rate).
+    None values are dropped; the slope is fit on whatever points remain.
+    If `dates` (a parallel list of 'YYYY-MM-DD' strings) is provided, x-values
+    are real calendar-day offsets, so days missing entirely from the DB don't
+    compress the time axis and steepen the apparent rate of rise. Without
+    dates, x is array position.
     Returns None if < 3 valid points (can't fit a meaningful line).
     """
-    pts = [(i, v) for i, v in enumerate(series) if v is not None]
+    # Calendar x-axis when dates are available; array index otherwise.
+    # Any missing/unparseable date → fall back to index for the WHOLE series
+    # (mixing calendar and index x-values in one fit would be incoherent).
+    xs = None
+    if dates and len(dates) == len(series):
+        parsed, base = [], None
+        for ds in dates:
+            if not ds:
+                parsed.append(None)
+                continue
+            try:
+                d0 = datetime.strptime(ds, "%Y-%m-%d").date()
+            except ValueError:
+                parsed.append(None)
+                continue
+            if base is None:
+                base = d0
+            parsed.append((d0 - base).days)
+        if all(x is not None for x in parsed):
+            xs = parsed
+    pts = []
+    for i, v in enumerate(series):
+        if v is None:
+            continue
+        pts.append((xs[i], v) if xs else (i, v))
     if len(pts) < 3:
         return None
     n = len(pts)
@@ -363,6 +390,13 @@ STRAIN_METRICS = [
     ("hrv",  lambda d: d.get("avg_sleep_hrv"),                    0.30, True,  "HRV"),
     ("temp", lambda d: d.get("temp_deviation"),                   0.45, False, "Temp Δ"),
 ]
+
+# Minimum noise floor (σ) per metric. A perfectly flat baseline (std=0,
+# MAD=0 — e.g. a sensor stuck on one value) would make the z undefined and
+# the metric silently skipped (noise==0 → continue) exactly when a real
+# spike arrives. Floors keep the metric alive; they sit below real
+# physiological variability so they never change live scoring.
+MIN_NOISE = {"rhr": 1.0, "hrv": 1.0, "temp": 0.05}
 
 def _day_level_score(day, metric_baselines):
     """Quick level-only strain score for a single day (used for the
@@ -434,6 +468,8 @@ def assess_strain(history):
     for key, extract, weight, inverted, _label in STRAIN_METRICS:
         base_series = [extract(d) for d in baseline_pool]
         mean, noise = _baseline_stats(base_series)
+        if noise is not None:
+            noise = max(noise, MIN_NOISE.get(key, 0.0))
         metric_baselines[key] = {
             "mean": mean, "noise": noise, "weight": weight,
             "inverted": inverted, "extract": extract,
@@ -472,7 +508,7 @@ def assess_strain(history):
         # median reference is essential: a single outlier (e.g. the -1.74°C
         # temp on 07-21) drags the mean to -0.30, making a normal +0.03 day
         # look +0.5σ elevated and letting the reversion slope through.
-        slope = linear_slope(recent_series)
+        slope = linear_slope(recent_series, [d.get("date") for d in recent])
         if slope is not None:
             gate_ref = _median([mb["extract"](d) for d in baseline_pool]) or mean
             z_level_gate = (today_val - gate_ref) / noise
@@ -513,7 +549,7 @@ def assess_strain(history):
         # 0.08 weight cap keeps it from dominating even when the level has
         # already crashed (it ADDS to the level signal rather than replacing).
         recent_rec = [d.get("recovery_index") for d in history[-3:]]
-        rec_slope = linear_slope(recent_rec)
+        rec_slope = linear_slope(recent_rec, [d.get("date") for d in history[-3:]])
         if rec_slope is not None and rec_slope < 0:
             z_rec_slope_s = -(rec_slope * 3) / rec_noise   # 3-day drop in σ, + = strain
             if z_rec_slope_s > 1.0:
@@ -525,9 +561,18 @@ def assess_strain(history):
 
     strain_today = sum(scores.values())
 
-    # ── Persistence: how many of the last 3 days were elevated? ──
+    # ── Persistence: how many of the last 3 CALENDAR days were elevated? ──
+    # Calendar-aligned, not row-aligned: days missing entirely from the DB
+    # would make the last 3 rows span more than 3 calendar days and distort
+    # the persistence count.
+    try:
+        t_date = datetime.strptime(today.get("date") or "", "%Y-%m-%d").date()
+        cal_window = {(t_date - timedelta(days=i)).isoformat() for i in range(3)}
+        recent_rows = [d for d in history[-5:] if d.get("date") in cal_window]
+    except ValueError:
+        recent_rows = history[-3:]
     elevated_days = sum(
-        1 for d in history[-3:]
+        1 for d in recent_rows
         if _day_level_score(d, metric_baselines) >= 1.0
     )
 
@@ -554,7 +599,10 @@ def format_display(val, suffix=""):
 def build_report():
     """Fetch, store, assess, and return the daily report string."""
     conn = init_db()
-    today = datetime.now(timezone.utc)
+    # LOCAL calendar date, not UTC: the nightly check-in runs at 21:00 local,
+    # which is already the next UTC day in North America — a UTC "today" would
+    # fetch an unpopulated date and file data under tomorrow.
+    today = datetime.now()
     yesterday = today - timedelta(days=1)
     y_str = yesterday.strftime("%Y-%m-%d")
     t_str = today.strftime("%Y-%m-%d")
@@ -563,6 +611,7 @@ def build_report():
         y_data = fetch_day(y_str)
         t_data = fetch_day(t_str)
     except Exception as e:
+        conn.close()
         return f"❌ API error: {e}"
 
     y_metrics = y_data.get("data", {}).get("metrics", {}).get(y_str, [])
@@ -691,6 +740,7 @@ def build_report():
     history_count = len([d for d in history if d.get("sleep_score") is not None])
     parts.append(f"\n📊 *Baseline: {history_count} days of data*")
 
+    conn.close()
     return "\n".join([p for p in parts if p])
 
 # ─── Backfill ─────────────────────────────────────────────────────────────────
@@ -880,7 +930,7 @@ def _mcp_handle(method, params):
             }, indent=2)}]}, None
         if name == "symptom_radar_label":
             date_str = str(args.get("date") or
-                          datetime.now(timezone.utc).strftime("%Y-%m-%d"))
+                          datetime.now().strftime("%Y-%m-%d"))
             label = str(args.get("label") or "")
             if label not in LABELS:
                 return None, f"label must be one of {LABELS}"
@@ -972,7 +1022,7 @@ if __name__ == "__main__":
     elif args.backfill:
         backfill(args.backfill)
     elif args.label:
-        date_str = args.label_date or datetime.now(timezone.utc).strftime("%Y-%m-%d")
+        date_str = args.label_date or datetime.now().strftime("%Y-%m-%d")
         log_label(date_str, args.label, args.label_note)
         print(f"✅ Logged {date_str}: {args.label}"
               + (f" ({args.label_note})" if args.label_note else ""))

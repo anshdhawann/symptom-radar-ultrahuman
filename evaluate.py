@@ -25,21 +25,38 @@ Usage:
 """
 import argparse
 import datetime
+import json
+import os
 import sqlite3
 
 import symptom_radar as sr
 
-# Example confirmed-sick window (synthetic example data — replace with yours)
-CONFIRMED_SICK = {"2024-03-10", "2024-03-11", "2024-03-12"}
+# ── Ground truth ──────────────────────────────────────────────────────────────
+# Real episode dates are PERSONAL HEALTH DATA and live in episodes.json
+# (gitignored), NOT in this file. Shape:
+#   {"confirmed_sick": ["YYYY-MM-DD", ...],
+#    "episodes":        ["YYYY-MM-DD", ...]}   # multi-signal clusters
+# If episodes.json is absent, synthetic example dates are used and a warning
+# is printed — the printed metrics are then meaningless.
+_EPISODES_FILE = os.path.join(
+    os.path.dirname(os.path.abspath(__file__)), "episodes.json")
 
-# Multi-signal physiological episodes visible in the data. These are clusters
-# where RHR/HRV/Temp/Recovery moved together for 2+ days — the same pattern
-# as the confirmed sick window. (Synthetic example data — replace.)
-EPISODES = CONFIRMED_SICK | {
-    "2024-02-14", "2024-02-15", "2024-02-16",
-    "2024-02-28", "2024-02-29",
-    "2024-03-01",
-}
+if os.path.exists(_EPISODES_FILE):
+    with open(_EPISODES_FILE) as f:
+        _gt = json.load(f)
+    CONFIRMED_SICK = set(_gt.get("confirmed_sick", []))
+    EPISODES = CONFIRMED_SICK | set(_gt.get("episodes", []))
+else:
+    print("⚠️  episodes.json not found — using SYNTHETIC example ground truth.")
+    print("    All numbers below are meaningless until you add your own "
+          "episode dates (see README / labels.py).")
+    # Synthetic example data — replace with your own via episodes.json.
+    CONFIRMED_SICK = {"2024-03-10", "2024-03-11", "2024-03-12"}
+    EPISODES = CONFIRMED_SICK | {
+        "2024-02-14", "2024-02-15", "2024-02-16",
+        "2024-02-28", "2024-02-29",
+        "2024-03-01",
+    }
 
 # 1-day buffer around episodes: pre-onset ramp + recovery tail.
 BUFFER = set()

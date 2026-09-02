@@ -22,6 +22,7 @@ Usage:
 import argparse
 import sqlite3
 import sys
+from datetime import datetime
 
 import symptom_radar as sr
 
@@ -142,7 +143,8 @@ def bulk_from_memory(text):
               "jul": 7, "aug": 8, "sep": 9, "oct": 10, "nov": 11, "dec": 12}
 
     def expand_dates(date_tokens):
-        """Expand 'Mar 26-27' → ['2024-03-26','2024-03-27'] and similar."""
+        """Expand 'Mar 26-27' → ['<current-year>-03-26','<current-year>-03-27']."""
+        year = datetime.now().year
         out = []
         for tok in date_tokens:
             m = re.match(r"(\d{4})-(\d{2})-(\d{2})$", tok)
@@ -153,10 +155,10 @@ def bulk_from_memory(text):
             if m:
                 mon = months[m.group(1)]
                 day1 = int(m.group(2))
-                out.append(f"2024-{mon:02d}-{day1:02d}")
+                out.append(f"{year}-{mon:02d}-{day1:02d}")
                 if m.group(3):
                     day2 = int(m.group(3))
-                    out.extend(f"2024-{mon:02d}-{d:02d}"
+                    out.extend(f"{year}-{mon:02d}-{d:02d}"
                                for d in range(day1, day2 + 1))
         return out
 
