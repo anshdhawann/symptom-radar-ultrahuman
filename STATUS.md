@@ -13,21 +13,33 @@ privacy-preserving alternative to commercial symptom-radar products.
 
 | Item | Evidence |
 |---|---|
-| Strain engine (clean baseline, trajectory, persistence, noise scaling) | `symptom_radar.py` — 36/36 tests pass |
+| Strain engine (clean baseline, trajectory, persistence, noise scaling) | `symptom_radar.py` — 40/40 tests pass |
 | Accuracy fixes: one-sided HRV, median-gated mean-reversion, recovery-slope leading indicator | commit `399f349` |
-| Retrospective evaluation on months of real data | `evaluate.py`: 14 flags, 11 true positives, 3 false positives, **4% FPR** |
+| Retrospective evaluation on months of real data | `evaluate.py`: 23 flags, 8 true positives, 13 false positives on refreshed data (see note below) |
 | Oura comparison (honest, vs published TemPredict numbers) | `BENCHMARK.md` |
 | Labeling infrastructure (fine/rough/sick) | `--label` CLI, MCP tools, `labels.py` |
-| Label collection automation | nightly cron (asks today's status, reports progress) |
+| Label collection | manual only (`--label` CLI / MCP tools) — the nightly check-in automation was retired |
 | Classification + verification | `train.py` (pure-stdlib logistic, leave-one-out, honest verdicts) |
 | Sensitivity analysis | `scenario.py` (hypotheses A/B/C for unconfirmed episodes) |
 | End-to-end pipeline proof | dry-run on scratch DB: from-memory → status → train → evaluate all work |
 
 ## The measured verdict (BENCHMARK.md, in full)
 
-1. **Strain detection: competitive.** 69% recall / 96% specificity vs
-   TemPredict's published 82% / 63% — a deliberately more conservative
-   operating point.
+> **Data-revision note (2026-09):** Ultrahuman's backend revised historical
+> metrics retroactively. Re-fetching the full archive changed mid-summer
+> values enough that most multi-day deviation clusters the original episode
+> list was built from no longer exist in the data (one confirmed-sick day's
+> temperature deviation shrank from +0.52 to +0.33 °C, for example). The
+> episodes were re-derived from the refreshed data, and `evaluate.py` now
+> also counts self-reported rough/sick labels as ground truth. Numbers
+> before/after the refresh are not comparable.
+
+1. **Strain detection: catches every labeled strain day.** On refreshed
+   data: 8/11 episode-or-labeled days flagged; all self-reported rough days
+   with ring data caught. The cost is a band of marginal level-1 flags on
+   unlabeled days (13, ~11% of healthy days) — most sit at index 1.0-1.4
+   with no multi-day persistence, i.e. single rough-sleep nights, not
+   illness-shaped signatures.
 2. **Pre-symptomatic lead time: cannot beat Oura.** That capability is
    RR-gated, and RR is not obtainable from the Ultrahuman Partner API
    (verified: no respiratory fields documented; legacy endpoint returns
@@ -52,14 +64,15 @@ Those hypotheses are no longer testable — collection is forward-only.
 ## The path forward (forward-only collection)
 
 Realistic pace from the wearer's history (3 sick days in ~3 months, most in
-one episode): reaching 15 sick labels by nightly check-ins alone is likely a
+one episode): reaching 15 sick labels by manual logging alone is likely a
 **12+ month** wait. Rough labels arrive faster (~1.7/month → 10 more ≈ 6
 months). The honest verdict: measured sick-vs-alcohol separation will not
 exist until real sick episodes accumulate AND are labeled as they happen.
 
-Until then, the engine still ships the practical value: strain flags with
-11 true positives / 3 false positives / 4% FPR, and BENCHMARK.md's honest
-Oura comparison stands.
+Until then, the engine still ships the practical value: every labeled
+strain day is flagged, plus `morning_alertness` (sleep-inertia minutes,
+captured since 2026-09) is stored for the label-correlation work ahead,
+and BENCHMARK.md's honest Oura comparison stands.
 
 ## If the wearer ever remembers a past episode
 
@@ -77,10 +90,11 @@ python3 labels.py --verify
 If the gate (15 sick + 15 rough) is met, drop `--force` (or edit run_verify)
 and `train.py` gives the validated verdict.
 
-## Automatic collection (no action needed)
+## Collection (manual, forward-only)
 
-- Nightly check-in: asks today's fine/rough/sick; logs via `--label`;
-  reports progress; auto-runs the verify chain once 15/15 is reached.
+- The nightly check-in automation was retired (2026-08) — collection is
+  manual: `python3 symptom_radar.py --label fine|rough|sick` or the MCP
+  tools whenever the wearer chooses to log.
 - Retrospective probing is retired (the wearer doesn't recall the old
   episodes); collection is forward-only.
 - Progress checkable anytime: `python3 labels.py --status`.

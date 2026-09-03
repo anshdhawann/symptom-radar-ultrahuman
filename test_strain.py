@@ -505,6 +505,53 @@ def test_bulk_from_memory_dont_remember_is_noop():
             sr.DB_PATH = old
 
 
+# ─── morning_alertness capture ────────────────────────────────────────────────
+def test_morning_alertness_extracted():
+    metrics = [{"type": "morning_alertness",
+                "object": {"value": 48, "unit": "minutes",
+                           "status": "calculated"}}]
+    assert sr.extract_metric(metrics, "morning_alertness") == {"value": 48}
+
+def test_init_db_migrates_morning_alertness():
+    """A database created before the column existed must gain it on init_db()
+    without dropping rows."""
+    import sqlite3, tempfile
+    old = sr.DB_PATH
+    try:
+        with tempfile.TemporaryDirectory() as td:
+            db = os.path.join(td, "t.db")
+            conn = sqlite3.connect(db)
+            conn.execute("CREATE TABLE daily_snapshots ("
+                         "date TEXT PRIMARY KEY, sleep_score REAL)")
+            conn.execute("INSERT INTO daily_snapshots VALUES ('2026-01-01', 80)")
+            conn.commit(); conn.close()
+
+            sr.DB_PATH = db
+            conn = sr.init_db()
+            cols = {r[1] for r in conn.execute("PRAGMA table_info(daily_snapshots)")}
+            assert "morning_alertness" in cols and "hr_drop" in cols
+            assert conn.execute("SELECT sleep_score FROM daily_snapshots").fetchone() == (80,)
+            conn.close()
+    finally:
+        sr.DB_PATH = old
+
+def test_morning_alertness_roundtrip():
+    import tempfile
+    old = sr.DB_PATH
+    try:
+        with tempfile.TemporaryDirectory() as td:
+            sr.DB_PATH = os.path.join(td, "t.db")
+            conn = sr.init_db()
+            sr.store_snapshot(conn, "2026-01-01",
+                              {"sleep_score": 80, "morning_alertness": 35})
+            row = conn.execute("SELECT sleep_score, morning_alertness "
+                               "FROM daily_snapshots WHERE date='2026-01-01'").fetchone()
+            assert row == (80.0, 35.0)
+            conn.close()
+    finally:
+        sr.DB_PATH = old
+
+
 # ─── Tiny fallback runner (if pytest isn't installed) ───────────────────────
 def _collect():
     fns = [(n, getattr(sys.modules[__name__], n)) for n in dir(sys.modules[__name__])

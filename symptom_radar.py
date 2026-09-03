@@ -72,14 +72,17 @@ def init_db():
             full_sleep_cycles REAL,
             restorative_sleep REAL,
             hr_drop REAL,
+            morning_alertness REAL,
             created_at TEXT DEFAULT (datetime('now'))
         )
     """)
-    # Idempotent migration: add hr_drop to pre-existing databases without
-    # dropping data or forcing a re-backfill.
+    # Idempotent migrations: add newer columns to pre-existing databases
+    # without dropping data or forcing a re-backfill.
     cols = {r[1] for r in conn.execute("PRAGMA table_info(daily_snapshots)")}
     if "hr_drop" not in cols:
         conn.execute("ALTER TABLE daily_snapshots ADD COLUMN hr_drop REAL")
+    if "morning_alertness" not in cols:
+        conn.execute("ALTER TABLE daily_snapshots ADD COLUMN morning_alertness REAL")
 
     # Daily self-report labels (the sickness-vs-strain training signal).
     conn.execute("""
@@ -158,7 +161,7 @@ def extract_metric(metrics, mtype):
                             "min": min(vals), "max": max(vals)}
             if mtype in ("recovery_index", "movement_index", "active_minutes",
                          "inactive_time", "weekly_active_minutes", "movements",
-                         "vo2_max", "hr_drop"):
+                         "vo2_max", "hr_drop", "morning_alertness"):
                 return {"value": obj.get("value")}
             if mtype == "night_rhr":
                 return {"avg": obj.get("avg")}
@@ -203,8 +206,8 @@ def store_snapshot(conn, date_str, data):
          avg_sleep_hrv, recovery_index, movement_index,
          active_minutes, inactive_time, total_steps, vo2_max,
          spo2, tosses_and_turns, full_sleep_cycles, restorative_sleep,
-         hr_drop)
-        VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)
+         hr_drop, morning_alertness)
+        VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)
     """, (
         date_str,
         data.get("sleep_score"),
@@ -229,6 +232,7 @@ def store_snapshot(conn, date_str, data):
         data.get("full_sleep_cycles"),
         data.get("restorative_sleep"),
         data.get("hr_drop"),
+        data.get("morning_alertness"),
     ))
     conn.commit()
 
@@ -633,6 +637,7 @@ def build_report():
     t_inactive = extract_metric(t_metrics, "inactive_time")
     t_vo2 = extract_metric(t_metrics, "vo2_max")
     t_hr_drop = extract_metric(t_metrics, "hr_drop")
+    t_alertness = extract_metric(t_metrics, "morning_alertness")
     t_hr = extract_metric(t_metrics, "hr")
     t_hrv = extract_metric(t_metrics, "hrv")
     t_temp = extract_metric(t_metrics, "temp")
@@ -661,6 +666,7 @@ def build_report():
         "total_steps": y_steps,
         "vo2_max": (t_vo2 or {}).get("value"),
         "hr_drop": (t_hr_drop or {}).get("value"),
+        "morning_alertness": (t_alertness or {}).get("value"),
         "spo2": (sleep_raw or {}).get("spo2"),
         "tosses_and_turns": (sleep_raw or {}).get("tosses_and_turns"),
         "full_sleep_cycles": (sleep_raw or {}).get("full_sleep_cycles"),
@@ -722,6 +728,11 @@ def build_report():
     ict = format_display((t_inactive or {}).get("value"))
     parts.append(f"Recovery: **{rec}/100** | Movement: **{mov}/100**")
     parts.append(f"Active: **{act} min** | Inactive: **{ict} min**")
+    alertness = (t_alertness or {}).get("value")
+    if alertness is not None:
+        # Sleep-inertia minutes: how long after waking before the nervous
+        # system is fully alert. Higher = rougher wakeup.
+        parts.append(f"Morning Alertness: **{int(alertness)} min**")
     if y_steps:
         parts.append(f"Total Steps: **{int(y_steps)}**")
     vo2 = format_display((t_vo2 or {}).get("value"))
@@ -801,6 +812,7 @@ def backfill(days=35):
                     "total_steps": extract_steps_total(metrics),
                     "vo2_max": (extract_metric(metrics, "vo2_max") or {}).get("value"),
                     "hr_drop": (extract_metric(metrics, "hr_drop") or {}).get("value"),
+                    "morning_alertness": (extract_metric(metrics, "morning_alertness") or {}).get("value"),
                     "spo2": (sleep_raw or {}).get("spo2"),
                     "tosses_and_turns": (sleep_raw or {}).get("tosses_and_turns"),
                     "full_sleep_cycles": (sleep_raw or {}).get("full_sleep_cycles"),
@@ -847,7 +859,7 @@ def _mcp_handle(method, params):
             },
             {
                 "name": "symptom_radar_history",
-                "description": "Query the local biometric database. Returns the most recent N days of one or more metrics, oldest-first. Metrics: sleep_score, total_sleep_min, night_rhr, sleep_rhr, avg_sleep_hrv, temp_deviation, recovery_index, movement_index, total_steps, vo2_max, hr_drop, spo2.",
+                "description": "Query the local biometric database. Returns the most recent N days of one or more metrics, oldest-first. Metrics: sleep_score, total_sleep_min, night_rhr, sleep_rhr, avg_sleep_hrv, temp_deviation, recovery_index, movement_index, total_steps, vo2_max, hr_drop, morning_alertness, spo2.",
                 "inputSchema": {
                     "type": "object",
                     "properties": {
@@ -905,7 +917,7 @@ def _mcp_handle(method, params):
                 "avg_sleep_hrv", "recovery_index", "movement_index",
                 "active_minutes", "inactive_time", "total_steps", "vo2_max",
                 "spo2", "tosses_and_turns", "full_sleep_cycles", "hr_drop",
-                "restorative_sleep", "created_at",
+                "restorative_sleep", "morning_alertness", "created_at",
             }
             safe = [m for m in metrics if m in valid_cols] or ["date", "sleep_score"]
             conn = init_db()

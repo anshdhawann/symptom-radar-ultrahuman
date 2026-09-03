@@ -36,6 +36,8 @@ import symptom_radar as sr
 # (gitignored), NOT in this file. Shape:
 #   {"confirmed_sick": ["YYYY-MM-DD", ...],
 #    "episodes":        ["YYYY-MM-DD", ...]}   # multi-signal clusters
+# Additionally, self-reported rough/sick labels (daily_labels table, local DB)
+# are independent user ground truth and count as episode days.
 # If episodes.json is absent, synthetic example dates are used and a warning
 # is printed — the printed metrics are then meaningless.
 _EPISODES_FILE = os.path.join(
@@ -57,6 +59,14 @@ else:
         "2024-02-28", "2024-02-29",
         "2024-03-01",
     }
+
+# User self-reported rough/sick days are ground truth in their own right:
+# the engine should flag strain on days the wearer actually felt rough.
+try:
+    _labeled = {d for d, lab, _ in sr.get_labels() if lab in ("rough", "sick")}
+except Exception:
+    _labeled = set()
+EPISODES |= _labeled
 
 # 1-day buffer around episodes: pre-onset ramp + recovery tail.
 BUFFER = set()
