@@ -694,8 +694,12 @@ def build_report():
         parts.append("🟢 *Biometrics within normal range*")
     parts.append("")
 
-    # Sleep
-    if sleep_raw:
+    # Sleep. A sleep metric object can exist while carrying no data yet
+    # ({"index_valid": false} — ring hasn't processed/synced the night), which
+    # used to render a block of em-dashes that reads like a parsing failure.
+    sleep_has_data = bool(sleep_raw) and any(
+        v is not None for v in sleep_raw.values())
+    if sleep_has_data:
         s = sleep_raw
         score = format_display(s.get("sleep_score"))
         total = format_display(s.get("total_sleep_min"), " min")
@@ -716,9 +720,14 @@ def build_report():
         parts.append(f"Score: **{score}/100** | Total: **{total}** | Eff: **{eff}**")
         parts.append(f"Deep: **{deep}** | Light: **{light}** | REM: **{rem}**")
         parts.append(f"Cycles: **{cycles}** | Restorative: **{restor}**")
-        parts.append(f"Sleep HRV: **{hrv_val}** | RHR: **{rhr_display}**")
+        parts.append(f"Sleep HRV: **{format_display(hrv_val)}** | RHR: **{rhr_display}**")
         parts.append(f"Body Temp: **{avg_temp}** (Δ{temp_str})")
         parts.append(f"SPO2: **{spo2}** | Tosses: {tosses}")
+    else:
+        parts.append("\n**😴 Sleep**")
+        parts.append("⏳ *No sleep record for today yet — ring has not synced last night*")
+        if rhr_val is not None:
+            parts.append(f"RHR: **{format_display(rhr_val, ' bpm')}**")
 
     # Recovery & Activity
     parts.append("\n**💪 Recovery & Activity**")
