@@ -157,8 +157,11 @@ def extract_metric(metrics, mtype):
                 vals = [v.get("value") for v in obj.get("values", [])
                         if isinstance(v.get("value"), (int, float))]
                 if vals:
+                    # Raw per-sample floats (e.g. 31.44000053405762) leak ugly
+                    # into the digest; round for display. Ints pass through as
+                    # ints (round(53, 1) == 53).
                     return {"avg": round(sum(vals)/len(vals), 1),
-                            "min": min(vals), "max": max(vals)}
+                            "min": round(min(vals), 1), "max": round(max(vals), 1)}
             if mtype in ("recovery_index", "movement_index", "active_minutes",
                          "inactive_time", "weekly_active_minutes", "movements",
                          "vo2_max", "hr_drop", "morning_alertness"):
@@ -600,6 +603,13 @@ STRAIN_ICONS = {0: "✅ Normal", 1: "🟡 Elevated", 2: "🔴 Significant strain
 def format_display(val, suffix=""):
     return "—" if val is None else f"{val}{suffix}"
 
+def fmt_minutes(val):
+    """Whole minutes for the digest; raw API floats (inactive_time arrives as
+    40.81666666666667) round to the nearest minute."""
+    if isinstance(val, (int, float)):
+        return f"{round(val)} min"
+    return "—" if val is None else f"{val} min"
+
 def build_report():
     """Fetch, store, assess, and return the daily report string."""
     conn = init_db()
@@ -733,10 +743,10 @@ def build_report():
     parts.append("\n**💪 Recovery & Activity**")
     rec = format_display((t_recovery or {}).get("value"))
     mov = format_display((t_movement or {}).get("value"))
-    act = format_display((t_active or {}).get("value"))
-    ict = format_display((t_inactive or {}).get("value"))
+    act = fmt_minutes((t_active or {}).get("value"))
+    ict = fmt_minutes((t_inactive or {}).get("value"))
     parts.append(f"Recovery: **{rec}/100** | Movement: **{mov}/100**")
-    parts.append(f"Active: **{act} min** | Inactive: **{ict} min**")
+    parts.append(f"Active: **{act}** | Inactive: **{ict}**")
     alertness = (t_alertness or {}).get("value")
     if alertness is not None:
         # Sleep-inertia minutes: how long after waking before the nervous
