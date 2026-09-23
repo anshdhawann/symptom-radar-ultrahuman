@@ -534,7 +534,9 @@ def assess_strain(history):
         if z_blend > 0:
             scores[key] = z_blend * mb["weight"]
             arrow = "↓" if inverted else "↑"
-            contributions.append(f"{label} {arrow}{today_val}")
+            # Raw API floats (e.g. temp_deviation 0.02447553752388387)
+            # leak ugly into the digest; round for display.
+            contributions.append(f"{label} {arrow}{round(today_val, 2)}")
 
     # Recovery: level deficit + SLOPE (leading indicator)
     # A sharp multi-day recovery decline precedes the RHR/HRV/temp crash by
