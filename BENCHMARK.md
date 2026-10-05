@@ -34,23 +34,37 @@ these TemPredict numbers are the best public proxy.
 
 ## 3. This engine's measured numbers (retrospective evaluation dataset)
 
-From `evaluate.py` (no-lookahead scoring, corrected episode labels):
+From `evaluate.py` (no-lookahead scoring), re-run 2026-10-05 on 163 days of
+data (2026-04-26 to 2026-10-05).
+
+> **Data-revision note (2026-09):** Ultrahuman's backend revised historical
+> metrics retroactively. Re-fetching the archive shrank several mid-summer
+> deviations (one confirmed-sick day's temperature deviation went from
+> +0.52 to +0.33 °C), and episodes were re-derived from the refreshed data.
+> The earlier figures in this file (14 flags, 3 FP, 69% recall, 96%
+> specificity on 78 healthy days) were measured before that revision, are
+> not comparable, and are superseded by the table below.
 
 | Metric | Value |
 |---|---|
-| Flags (level ≥ 1) | 14 |
-| True positives (episode days) | 11 |
-| False positives | 3 (4% FPR over 78 healthy days) |
-| Episode-day recall | 11/16 = 0.69 |
-| Confirmed sick window | day 1 caught ✓; warning builds the day before (rec -11/day); day 3 honest miss |
+| Flags (level ≥ 1) | 27 |
+| True positives (episode days) | 8 (plus 2 adjacent-to-episode days) |
+| False positives | 17 (11% FPR over 152 healthy days) |
+| Episode-day recall | 8/11 = 0.73 |
+| Confirmed sick window (3 days) | day 1 caught; days 2 and 3 missed (strain index near 0) |
 
 For direct comparison with TemPredict's **82% sens / 63% spec**:
 
 | | TemPredict | This engine |
 |---|---|---|
-| Sensitivity | 82% | **69%** (episode days) |
-| Specificity | 63% | **96%** (3 FP / 78 healthy) |
-| Lead time | 2.75 days (RR-driven) | **1-2 days** (recovery-slope, on episodes where it fired) |
+| Sensitivity | 82% | **73%** (episode days, n=11) |
+| Specificity | 63% | **89%** (17 FP / 152 healthy) |
+| Lead time | 2.75 days (RR-driven) | **not demonstrated** on refreshed data (the day before the confirmed sick window is not flagged) |
+
+Sample sizes are tiny (11 episode days, 3 confirmed sick days, one wearer),
+so treat these as directional, not a validated operating point. Most of the
+17 false positives sit at strain index 1.0-1.6 with no multi-day
+persistence (single rough nights); one reached Significant.
 
 **Reading:** this engine trades sensitivity for specificity — it flags less
 often but is far more accurate when it does. That is a *deliberate design
@@ -73,10 +87,10 @@ biased toward sensitivity because its use case was screening.
 
 ## 5. Where this engine wins (measured, not claimed)
 
-1. **Specificity: 96% vs 63%.** At the current operating point, this engine
-   fires on 4% of healthy days; TemPredict's published specificity accepts
-   37% false flags. On a retrospective dataset, that difference is the
-   difference between "the tool is useful" and "the tool is noise."
+1. **Specificity: 89% vs 63%.** At the current operating point, this engine
+   fires on 11% of healthy days; TemPredict's published specificity accepts
+   37% false flags. Caveat: single wearer, 152 healthy days, so this is a
+   directional comparison, not a like-for-like trial.
 2. **Transparency.** Every flag is decomposable into per-metric z-scores and
    contributions. Oura's is a black box.
 3. **Zero training data required.** Works from day 1; improves with labels.
@@ -89,7 +103,8 @@ Oura does not solve this either (it has no way to know what you did
 yesterday), but its extra signals and training data make its *strain* flag
 more reliable. Our path to the same place is the label collection loop:
 
-- Nightly cron collects fine/rough/sick labels
+- Labels are logged manually (`--label fine|rough|sick` or the MCP tools);
+  the nightly check-in automation was retired in 2026-08
 - `train.py` gates at 15 sick + 15 rough, then trains + verifies the
   separation classifier (leave-one-out, honest verdict)
 - `scenario.py` shows the stakes: if the strong unconfirmed episodes were
@@ -99,9 +114,10 @@ more reliable. Our path to the same place is the label collection loop:
 
 ## 7. Verdict
 
-- **On strain detection: competitive.** 69% recall / 96% specificity on the
-  retrospective dataset vs. TemPredict's published 82% / 63% — a different,
-  more conservative operating point.
+- **On strain detection: competitive.** 73% recall / 89% specificity on the
+  retrospective dataset (re-run 2026-10-05, post data revision) vs.
+  TemPredict's published 82% / 63%: a different, more conservative
+  operating point, on a much smaller sample.
 - **On pre-symptomatic lead time: cannot beat Oura.** That capability is
   RR-gated, and RR is not obtainable from the Ultrahuman API. Claiming
   otherwise would be dishonest.

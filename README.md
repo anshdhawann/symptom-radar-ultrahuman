@@ -115,6 +115,23 @@ python3 symptom_radar.py --backfill
 
 Fetches ~35 days of historical data from the Ultrahuman API to build your baseline immediately.
 
+### Label days and measure accuracy (optional)
+
+```bash
+# Log how you actually felt (fine | rough | sick); defaults to today
+python3 symptom_radar.py --label rough --label-note "late night, 3 drinks"
+python3 symptom_radar.py --label sick --label-date 2026-07-10
+python3 symptom_radar.py --labels          # list logged labels
+
+python3 labels.py --status                 # progress toward the training gate
+python3 evaluate.py                        # retrospective recall / false-positive rate
+python3 evaluate.py --labels               # do flags separate sick vs rough vs fine?
+python3 train.py                           # sick-vs-rough classifier (gated at 15 + 15 labels)
+python3 labels.py --verify                 # runs the whole chain: status, scenario, train, evaluate
+```
+
+`evaluate.py` reads your episode dates from a local, gitignored `episodes.json` (personal health data never enters the repo). See [BENCHMARK.md](BENCHMARK.md) for measured results and [STATUS.md](STATUS.md) for what is done and what is blocked.
+
 ### Automation (cron)
 
 ```bash
@@ -187,11 +204,20 @@ export SYMPTOM_RADAR_DB="/path/to/custom.db"
 ```
 symptom-radar-ultrahuman/
 ├── symptom_radar.py   # Main script: fetch, store, assess, report
+├── evaluate.py        # Retrospective evaluation (recall, false-positive rate, label separation)
+├── labels.py          # Label status, natural-language backfill, one-command verify chain
+├── train.py           # Pure-stdlib logistic classifier, leave-one-out, gated on label counts
+├── scenario.py        # Sensitivity analysis for unconfirmed episodes
+├── test_strain.py     # Engine + storage tests (pytest)
+├── BENCHMARK.md       # Measured results vs published TemPredict numbers
+├── STATUS.md          # What is done, what is blocked, why
 ├── requirements.txt   # Python dependencies
 ├── LICENSE            # MIT
-├── .gitignore         # .env, *.db, __pycache__
+├── .gitignore         # .env, *.db, episodes.json, __pycache__
 └── .env               # Your API token (gitignored, you create this)
 ```
+
+Run the tests with `ULTRAHUMAN_TOKEN=dummy python3 -m pytest test_strain.py` (no network calls).
 
 ## Legal & Attribution
 

@@ -14,8 +14,8 @@ privacy-preserving alternative to commercial symptom-radar products.
 | Item | Evidence |
 |---|---|
 | Strain engine (clean baseline, trajectory, persistence, noise scaling) | `symptom_radar.py` — 40/40 tests pass |
-| Accuracy fixes: one-sided HRV, median-gated mean-reversion, recovery-slope leading indicator | commit `399f349` |
-| Retrospective evaluation on months of real data | `evaluate.py`: 23 flags, 8 true positives, 13 false positives on refreshed data (see note below) |
+| Accuracy fixes: one-sided HRV, median-gated mean-reversion, recovery-slope leading indicator | `symptom_radar.py` (shipped in the initial public commit) |
+| Retrospective evaluation on months of real data | `evaluate.py` (re-run 2026-10-05, 163 days): 27 flags, 8 true positives, 17 false positives (11% FPR), recall 8/11 |
 | Oura comparison (honest, vs published TemPredict numbers) | `BENCHMARK.md` |
 | Labeling infrastructure (fine/rough/sick) | `--label` CLI, MCP tools, `labels.py` |
 | Label collection | manual only (`--label` CLI / MCP tools) — the nightly check-in automation was retired |
@@ -35,9 +35,9 @@ privacy-preserving alternative to commercial symptom-radar products.
 > before/after the refresh are not comparable.
 
 1. **Strain detection: catches every labeled strain day.** On refreshed
-   data: 8/11 episode-or-labeled days flagged; all self-reported rough days
-   with ring data caught. The cost is a band of marginal level-1 flags on
-   unlabeled days (13, ~11% of healthy days) — most sit at index 1.0-1.4
+   data (2026-10-05): 8/11 episode days flagged; 4/5 self-reported rough days
+   above the fine-day threshold. The cost is a band of marginal level-1 flags
+   on unlabeled days (17, ~11% of healthy days) — most sit at index 1.0-1.4
    with no multi-day persistence, i.e. single rough-sleep nights, not
    illness-shaped signatures.
 2. **Pre-symptomatic lead time: cannot beat Oura.** That capability is
