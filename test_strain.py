@@ -741,6 +741,22 @@ def test_invalid_fetched_core_metrics_report_no_data(tmp_path, monkeypatch):
     assert "⚪ No data: ring not synced" in sr.build_report()
 
 
+def test_empty_today_fetch_does_not_store_yesterday_steps(tmp_path, monkeypatch):
+    conn, date = _report_db(tmp_path, monkeypatch, _flat_history())
+    sr.store_snapshot(conn, date, {**_flat_history()[0], "total_steps": 123})
+    conn.close()
+    monkeypatch.setattr(sr, "fetch_day", lambda requested: {
+        "data": {"metrics": {requested: [] if requested == date else [
+            {"type": "steps", "object": {"values": [{"value": 999}]}}]}}})
+    report = sr.build_report()
+    assert "⚪ No data: ring not synced" in report
+    conn = sr.init_db()
+    assert conn.execute("SELECT total_steps FROM daily_snapshots WHERE date=?",
+                        (date,)).fetchone() == (123.0,)
+    assert conn.execute("SELECT COUNT(*) FROM metric_revisions").fetchone() == (0,)
+    conn.close()
+
+
 # ─── Tiny fallback runner (if pytest isn't installed) ───────────────────────
 def _collect():
     fns = [(n, getattr(sys.modules[__name__], n)) for n in dir(sys.modules[__name__])
