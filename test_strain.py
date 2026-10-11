@@ -767,6 +767,20 @@ def test_structured_recovery_contribution_matches_total():
     assert result["strain_index"] == 0.55
 
 
+def test_invalid_temperature_fetch_preserves_values_and_reports_no_data(tmp_path, monkeypatch):
+    conn, date = _report_db(tmp_path, monkeypatch, _flat_history())
+    sr.store_snapshot(conn, date, _flat_history()[0])
+    conn.close()
+    _mock_metrics(monkeypatch, [
+        {"type": "sleep", "object": {"temperature_deviation": {"celsius": "invalid"}}},
+    ])
+    assert "⚪ No data: ring not synced" in sr.build_report()
+    conn = sr.init_db()
+    assert conn.execute("SELECT temp_deviation FROM daily_snapshots WHERE date=?",
+                        (date,)).fetchone() == (0.0,)
+    conn.close()
+
+
 # ─── Tiny fallback runner (if pytest isn't installed) ───────────────────────
 def _collect():
     fns = [(n, getattr(sys.modules[__name__], n)) for n in dir(sys.modules[__name__])
