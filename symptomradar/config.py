@@ -15,17 +15,16 @@ class MissingTokenError(RuntimeError):
 
 
 def require_token(env_path=None):
-    """Prefer the process environment, then the checkout's optional env file."""
+    """Keep env-file precedence, falling back to the process environment."""
     token = os.environ.get("ULTRAHUMAN_TOKEN")
-    if not token:
-        path = Path(env_path) if env_path is not None else ENV_PATH
-        if path.exists():
-            with path.open() as stream:
-                for line in stream:
-                    key, sep, value = line.strip().partition("=")
-                    if sep and key == "ULTRAHUMAN_TOKEN":
-                        token = value.strip("\"'")
-                        break
+    path = Path(env_path) if env_path is not None else ENV_PATH
+    if path.exists():
+        with path.open() as stream:
+            for line in stream:
+                key, sep, value = line.strip().partition("=")
+                if sep and key == "ULTRAHUMAN_TOKEN":
+                    token = value.strip("\"'")
+                    break
     if not token:
         raise MissingTokenError("ULTRAHUMAN_TOKEN is not set; API commands require a token.")
     return token

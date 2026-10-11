@@ -63,8 +63,10 @@ def test_token_file_and_environment(tmp_path, monkeypatch):
     env_file.write_text('ULTRAHUMAN_TOKEN="fixture-token"\n')
     assert config.require_token(env_file) == "fixture-token"
     monkeypatch.setenv("ULTRAHUMAN_TOKEN", "env-token")
-    assert config.require_token(env_file) == "env-token"
+    assert config.require_token(env_file) == "fixture-token"
     assert config.require_token(tmp_path / "absent") == "env-token"
+    env_file.write_text("UNRELATED=value\n")
+    assert config.require_token(env_file) == "env-token"
 
 
 def test_offline_mcp_tools_without_token(checkout):
