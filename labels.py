@@ -71,9 +71,10 @@ def review_candidates():
     print(f"{shown} candidate days above. For each you remember, log:")
     print("  python3 symptom_radar.py --label <fine|rough|sick> "
           "--label-date YYYY-MM-DD --label-note 'remembered'")
-    print("Target: 15 sick + 15 rough total (currently "
-          f"{sum(1 for _, l, _ in storage.get_labels() if l == 'sick')} sick / "
-          f"{sum(1 for _, l, _ in storage.get_labels() if l == 'rough')} rough).")
+    print("Target: 15 days and 5 independent episodes per class (currently "
+          f"{sum(1 for _, label, _ in storage.get_labels() if label == 'sick')} sick / "
+          f"{sum(1 for _, label, _ in storage.get_labels() if label == 'rough')} rough days; "
+          "labels.py --status counts episodes).")
 
 def bulk_from_memory(text):
     """Parse a natural-language retrospective answer and log all labels.
