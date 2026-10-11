@@ -1,225 +1,227 @@
 #!/usr/bin/env python3
-"""
-Retrospective evaluation harness for the Symptom Radar engine.
+"""Chronological, read-only evaluation against independent self-report labels.
 
-Scores every day in ultrahuman.db using only history BEFORE that day
-(no lookahead), then compares against labeled ground truth to measure
-recall (did we catch strain episodes?) and false-positive rate.
-
-Ground truth:
-  - CONFIRMED_SICK: days the user confirmed feeling ill.
-  - EPISODES: multi-signal physiological clusters (RHR↑ + HRV↓ + Temp↑ + Rec↓
-    together for 2+ days) — the same physiological pattern as a confirmed
-    sick window. These are treated as true positives.
-  - Everything else = healthy baseline. Days adjacent to episodes (1 day
-    before/after) are excluded from both counts.
-
-The dates below are SYNTHETIC EXAMPLE DATA so the harness runs out of the
-box. Replace them with dates from your own data before trusting the
-numbers (see labels.py --from-memory / --review to collect yours).
-
-Usage:
-    python3 evaluate.py              # summary vs corrected labels
-    python3 evaluate.py --labels     # label-aware separation analysis:
-                                     # do sick/rough/fine days cluster apart?
+Illness uses sick labels plus confirmed_sick dates. Strain uses rough/sick
+labels. Ring-derived clusters measure agreement only. Only fine labels are
+true negatives; unknown days have their own alert rate. No synthetic labels
+are substituted when episodes.json is absent.
 """
 import argparse
-import datetime
+from collections import Counter
+from contextlib import closing
+from datetime import date, timedelta
+import hashlib
 import json
 import os
+from pathlib import Path
 import sqlite3
+import statistics
 
-import symptom_radar as sr
+SCORED_COLUMNS = ("date", "night_rhr", "sleep_rhr", "avg_sleep_hrv",
+                  "temp_deviation", "recovery_index")
+EPISODES_FILE = Path(__file__).with_name("episodes.json")
 
-# ── Ground truth ──────────────────────────────────────────────────────────────
-# Real episode dates are PERSONAL HEALTH DATA and live in episodes.json
-# (gitignored), NOT in this file. Shape:
-#   {"confirmed_sick": ["YYYY-MM-DD", ...],
-#    "episodes":        ["YYYY-MM-DD", ...]}   # multi-signal clusters
-# Additionally, self-reported rough/sick labels (daily_labels table, local DB)
-# are independent user ground truth and count as episode days.
-# If episodes.json is absent, synthetic example dates are used and a warning
-# is printed — the printed metrics are then meaningless.
-_EPISODES_FILE = os.path.join(
-    os.path.dirname(os.path.abspath(__file__)), "episodes.json")
 
-if os.path.exists(_EPISODES_FILE):
-    with open(_EPISODES_FILE) as f:
-        _gt = json.load(f)
-    CONFIRMED_SICK = set(_gt.get("confirmed_sick", []))
-    EPISODES = CONFIRMED_SICK | set(_gt.get("episodes", []))
-else:
-    print("⚠️  episodes.json not found — using SYNTHETIC example ground truth.")
-    print("    All numbers below are meaningless until you add your own "
-          "episode dates (see README / labels.py).")
-    # Synthetic example data — replace with your own via episodes.json.
-    CONFIRMED_SICK = {"2024-03-10", "2024-03-11", "2024-03-12"}
-    EPISODES = CONFIRMED_SICK | {
-        "2024-02-14", "2024-02-15", "2024-02-16",
-        "2024-02-28", "2024-02-29",
-        "2024-03-01",
+def digest(value):
+    return hashlib.sha256(json.dumps(value, sort_keys=True, separators=(",", ":"),
+                                     allow_nan=False).encode()).hexdigest()
+
+
+def load_inputs(db_path, episodes_path=None):
+    """Read one SQLite transaction without creating tables or migrating."""
+    with closing(sqlite3.connect(Path(db_path).resolve().as_uri() + "?mode=ro", uri=True)) as conn:
+        conn.execute("BEGIN")
+        conn.row_factory = sqlite3.Row
+        history = [dict(row) for row in conn.execute("SELECT * FROM daily_snapshots ORDER BY date")]
+        has_labels = conn.execute("SELECT 1 FROM sqlite_master WHERE type='table' AND name='daily_labels'").fetchone()
+        labels = {row["date"]: row["label"] for row in conn.execute("SELECT date, label FROM daily_labels")} if has_labels else {}
+    annotations = {}
+    if episodes_path is not None and Path(episodes_path).exists():
+        annotations = json.loads(Path(episodes_path).read_text())
+    confirmed = set(annotations.get("confirmed_sick", []))
+    clusters = set(annotations.get("episodes", []))
+    for day in {row["date"] for row in history} | set(labels) | confirmed | clusters:
+        date.fromisoformat(day)
+    if set(labels.values()) - {"fine", "rough", "sick"}:
+        raise ValueError("Labels must be fine, rough, or sick")
+    fingerprint = {
+        "row_count": len(history),
+        "date_range": [history[0]["date"], history[-1]["date"]] if history else [None, None],
+        "scored_columns": list(SCORED_COLUMNS),
+        "sha256": digest([[row.get(key) for key in SCORED_COLUMNS] for row in history]),
+        "labels_sha256": digest(labels),
+        "annotations_sha256": digest({"confirmed_sick": sorted(confirmed), "episodes": sorted(clusters)}),
+        "annotations_present": bool(episodes_path is not None and Path(episodes_path).exists()),
+    }
+    return history, labels, confirmed, clusters, fingerprint
+
+
+def score_all(history, scorer=None):
+    if scorer is None:
+        import symptom_radar as sr
+        scorer = sr.assess_strain_result
+    return [{"date": row["date"], **scorer(history[:i + 1])}
+            for i, row in enumerate(history)]
+
+
+def rate(numerator, n):
+    return {"numerator": numerator, "n": n, "value": numerator / n if n else None}
+
+
+def group_episodes(positives):
+    """Group calendar positives separated by at most one missing day."""
+    groups = []
+    for day in sorted(positives):
+        if not groups or (date.fromisoformat(day) - date.fromisoformat(groups[-1][-1])).days > 2:
+            groups.append([])
+        groups[-1].append(day)
+    return groups
+
+
+def section_metrics(scores, labels, positives, interpretation):
+    observed = {row["date"] for row in scores}
+    assessable = {row["date"] for row in scores if row["status"] == "ok"}
+    flagged = {row["date"] for row in scores if row["status"] == "ok" and row["level"] >= 1}
+    buffer = {str(date.fromisoformat(day) + timedelta(days=offset))
+              for day in positives for offset in (-1, 1)} - positives
+    eligible = assessable - buffer
+    positive_days = eligible & positives
+    fine = eligible & {d for d, label in labels.items() if label == "fine"} - positives
+    unknown = eligible - set(labels) - positives
+    episodes = []
+    unassessable_episodes = 0
+    outside_episodes = 0
+    for group in group_episodes(positives):
+        if not set(group) & observed:
+            outside_episodes += 1
+            continue
+        if not set(group) & assessable:
+            unassessable_episodes += 1
+            continue
+        start, end = date.fromisoformat(group[0]), date.fromisoformat(group[-1])
+        # Pre-onset buffers are excluded from day rates, not warning windows.
+        hits = sorted(d for d in flagged if start - timedelta(days=2) <= date.fromisoformat(d) <= end)
+        episodes.append({"start": str(start), "end": str(end),
+                         "positive_days": len(set(group) & eligible),
+                         "caught": bool(hits), "first_flagged_date": hits[0] if hits else None,
+                         "onset_delay_days": (date.fromisoformat(hits[0]) - start).days if hits else None})
+    delays = [e["onset_delay_days"] for e in episodes if e["caught"]]
+    return {
+        "interpretation": interpretation,
+        "positive_days_observed": len(positives & observed),
+        "positive_days_outside_input": len(positives - observed),
+        "unassessable_days": len(observed - assessable),
+        "buffer_days": len(buffer & assessable),
+        "eligible_days": len(eligible),
+        "other_labeled_days": len(eligible - positive_days - fine - unknown),
+        "day_recall": rate(len(positive_days & flagged), len(positive_days)),
+        "false_positive_rate": rate(len(fine & flagged), len(fine)),
+        "specificity": rate(len(fine - flagged), len(fine)),
+        "unknown_alert_rate": rate(len(unknown & flagged), len(unknown)),
+        "episode_recall": rate(sum(e["caught"] for e in episodes), len(episodes)),
+        "unassessable_episodes": unassessable_episodes,
+        "episodes_outside_input": outside_episodes,
+        "episodes": episodes,
+        "onset_delay": {"n": len(delays),
+                        "mean_days": statistics.mean(delays) if delays else None,
+                        "median_days": statistics.median(delays) if delays else None,
+                        "min_days": min(delays) if delays else None,
+                        "max_days": max(delays) if delays else None},
     }
 
-# User self-reported rough/sick days are ground truth in their own right:
-# the engine should flag strain on days the wearer actually felt rough.
-try:
-    _labeled = {d for d, lab, _ in sr.get_labels() if lab in ("rough", "sick")}
-except Exception:
-    _labeled = set()
-EPISODES |= _labeled
 
-# 1-day buffer around episodes: pre-onset ramp + recovery tail.
-BUFFER = set()
-for e in EPISODES:
-    d = datetime.date.fromisoformat(e)
-    BUFFER |= {str(d - datetime.timedelta(days=i)) for i in range(-1, 2)}
-
-
-def load_history():
-    conn = sqlite3.connect(sr.DB_PATH)
-    cur = conn.execute("SELECT * FROM daily_snapshots ORDER BY date ASC")
-    cols = [d[0] for d in cur.description]
-    rows = [dict(zip(cols, r)) for r in cur.fetchall()]
-    conn.close()
-    return rows
+def analyze_separation(scores, labels, buffer):
+    groups = {}
+    for label in ("fine", "rough", "sick"):
+        rows = [r for r in scores if labels.get(r["date"]) == label and
+                r["status"] == "ok" and r["date"] not in buffer]
+        indices = [r["strain_index"] for r in rows if r["strain_index"] is not None]
+        groups[label] = {"n": len(rows), "flag_rate": rate(sum(r["level"] >= 1 for r in rows), len(rows)),
+                         "strain_index_n": len(indices),
+                         "strain_index_mean": statistics.mean(indices) if indices else None,
+                         "strain_index_range": [min(indices), max(indices)] if indices else [None, None]}
+    return groups
 
 
-def score_all(history):
-    results = []
-    for i in range(len(history)):
-        level, detail = sr.assess_strain(history[:i + 1])
-        results.append((history[i]["date"], level, detail))
-    return results
+def evaluate_database(db_path, episodes_path=None, scorer=None):
+    history, labels, confirmed, clusters, fingerprint = load_inputs(db_path, episodes_path)
+    scores = score_all(history, scorer)
+    illness = confirmed | {d for d, label in labels.items() if label == "sick"}
+    strain = {d for d, label in labels.items() if label in ("rough", "sick")}
+    definitions = {
+        "illness": (illness, "independent ground truth: sick labels plus confirmed_sick dates"),
+        "strain": (strain, "independent ground truth: self-reported rough or sick labels"),
+        "cluster_agreement": (clusters, "agreement with cluster annotations, not accuracy"),
+    }
+    buffer = {str(date.fromisoformat(d) + timedelta(days=offset))
+              for d in strain for offset in (-1, 1)} - strain
+    return {
+        "input": fingerprint,
+        "policy": {"flag_level": 1, "episode_gap_days": 1, "episode_lead_days": 2,
+                   "day_buffer_days": 1, "true_negatives": "fine labels only",
+                   "episode_eligibility": "at least one assessable positive day",
+                   "onset_delay": "first flag minus onset; negative is lead time; caught episodes only",
+                   "warning_window": "includes pre-onset buffer days; flags must have status ok",
+                   "scoring": "each day uses only its chronological prefix, including that day"},
+        "label_counts": dict(sorted(Counter(labels.values()).items())),
+        "label_days_outside_input": len(set(labels) - {row["date"] for row in history}),
+        "status_counts": dict(Counter(row["status"] for row in scores)),
+        "unassessable_days": sum(row["status"] != "ok" for row in scores),
+        "flagged_dates": [r["date"] for r in scores if r["status"] == "ok" and r["level"] >= 1],
+        "sections": {key: section_metrics(scores, labels, positive, meaning)
+                     for key, (positive, meaning) in definitions.items()},
+        "label_separation": analyze_separation(scores, labels, buffer),
+        "scores": scores,
+    }
 
 
-def analyze_separation(history, results):
-    """Label-aware analysis: do sick / rough / fine days cluster apart on the
-    engine's features? This is the honest test of whether we can separate
-    real illness from non-illness strain using the self-report labels.
+def format_rate(measure):
+    value = f"{measure['value']:.3f}" if measure["value"] is not None else "unavailable"
+    return f"{measure['numerator']}/{measure['n']} = {value}"
 
-    Features per day (all computed from data BEFORE that day — no lookahead):
-      strain_idx  — the engine's strain index (weighted deviation)
-      rec_slope   — recovery 3-day slope (positive = falling = warning)
-      elevated_3d — how many of last 3 days were elevated
-    """
-    labels = {d: lbl for d, lbl, _ in sr.get_labels()}
-    import re
 
-    rows = []
-    for i in range(len(history)):
-        date = history[i]["date"]
-        if date not in labels:
-            continue
-        level, detail = results[i][1], results[i][2]
-        m_idx = re.search(r"Strain index: ([\d.]+)", detail)
-        m_el = re.search(r"Elevated in (\d)/3", detail)
-        strain = float(m_idx.group(1)) if m_idx else 0.0
-        elev = int(m_el.group(1)) if m_el else 0
-        has_rec_down = "Recovery↓" in detail
-        rows.append({
-            "date": date, "label": labels[date],
-            "strain": strain, "elev": elev, "rec_down": has_rec_down,
-            "level": level,
-        })
-
-    by_label = {"fine": [], "rough": [], "sick": []}
-    for r in rows:
-        by_label[r["label"]].append(r)
-
-    print("=" * 78)
-    print("LABEL SEPARATION ANALYSIS (self-reported fine/rough/sick)")
-    print("=" * 78)
-    print(f"{'Label':<8} {'n':>3} {'strain mean':>11} {'strain range':>20} "
-          f"{'flag%':>6} {'rec↓%':>6}")
-    for lbl in ("fine", "rough", "sick"):
-        rs = by_label[lbl]
-        if not rs:
-            print(f"{lbl:<8} {0:>3}  (no labels)")
-            continue
-        strains = [r["strain"] for r in rs]
-        flag_pct = 100 * sum(1 for r in rs if r["level"] >= 1) / len(rs)
-        rec_pct = 100 * sum(1 for r in rs if r["rec_down"]) / len(rs)
-        print(f"{lbl:<8} {len(rs):>3} {sum(strains)/len(strains):>11.2f} "
-              f"[{min(strains):.2f}–{max(strains):.2f}]".ljust(41)
-              + f"{flag_pct:>6.0f}% {rec_pct:>6.0f}%")
-
-    print()
-    print("Per-day detail:")
-    for r in sorted(rows, key=lambda x: -x["strain"]):
-        mark = " ✓" if r["level"] >= 1 else ""
-        print(f"  {r['date']}  {r['label']:<6} strain={r['strain']:.2f} "
-              f"elev={r['elev']}/3 rec↓={int(r['rec_down'])} lvl={r['level']}{mark}")
-
-    # Separation score: how well does strain index separate sick from rough?
-    sick = [r["strain"] for r in by_label["sick"]]
-    rough = [r["strain"] for r in by_label["rough"]]
-    fine = [r["strain"] for r in by_label["fine"]]
-    print()
-    if sick and rough and fine:
-        # Simple overlap measure: fraction of sick days with strain above the
-        # max fine day's strain (a usable threshold).
-        threshold = max(fine)
-        above = sum(1 for s in sick if s > threshold)
-        rough_above = sum(1 for s in rough if s > threshold)
-        print(f"Separation: strain threshold = {threshold:.2f} "
-              f"(max of {len(fine)} fine days)")
-        print(f"  sick days above threshold: {above}/{len(sick)}")
-        print(f"  rough days above threshold: {rough_above}/{len(rough)}")
-        print(f"  → sick-vs-fine separation: {above}/{len(sick)} "
-              f"({100*above/len(sick):.0f}%)")
-        if rough:
-            print(f"  → rough-vs-fine separation: {rough_above}/{len(rough)} "
-                  f"({100*rough_above/len(rough):.0f}%)")
-    print()
-    print("Interpretation: if 'sick' and 'rough' rows interleave, the current")
-    print("features CANNOT separate illness from non-illness strain — that is")
-    print("the limit the labels exist to overcome (need more labeled days).")
-    return rows
+def print_summary(result, labels_only=False):
+    fingerprint = result["input"]
+    print(f"Input: {fingerprint['row_count']} rows; date range {fingerprint['date_range']}")
+    print(f"Scored-column sha256: {fingerprint['sha256']}")
+    print(f"Labels sha256: {fingerprint['labels_sha256']}")
+    print(f"Annotations sha256: {fingerprint['annotations_sha256']}")
+    if not fingerprint["annotations_present"]:
+        print("No episodes.json supplied or found; using database labels only.")
+    print(f"Labels: {result['label_counts']}; statuses: {result['status_counts']}")
+    print(f"Unassessable days: {result['unassessable_days']}; flags: {len(result['flagged_dates'])}")
+    if labels_only:
+        print("LABEL SEPARATION ANALYSIS (assessable, non-buffer self-report days)")
+        for label, group in result["label_separation"].items():
+            print(f"{label}: n={group['n']}; flag rate {format_rate(group['flag_rate'])}; "
+                  f"strain mean={group['strain_index_mean']}; range={group['strain_index_range']}")
+        return
+    for key, section in result["sections"].items():
+        print(f"\n{key.upper()}: {section['interpretation']}")
+        print(f"Eligible days: {section['eligible_days']}; buffer exclusions: {section['buffer_days']}")
+        for metric in ("day_recall", "false_positive_rate", "specificity", "unknown_alert_rate", "episode_recall"):
+            name = "cluster-day agreement" if key == "cluster_agreement" and metric == "day_recall" else metric
+            print(f"  {name}: {format_rate(section[metric])}")
+        print(f"  onset_delay: {section['onset_delay']}")
+        print(f"  unassessable episodes: {section['unassessable_episodes']}")
+        for episode in section["episodes"]:
+            print(f"  episode {episode['start']} to {episode['end']}: "
+                  f"caught={episode['caught']}; onset delay={episode['onset_delay_days']}")
 
 
 def main():
-    ap = argparse.ArgumentParser()
-    ap.add_argument("--labels", action="store_true",
-                    help="run label-aware separation analysis")
-    args = ap.parse_args()
-
-    history = load_history()
-    results = score_all(history)
-
-    if args.labels:
-        analyze_separation(history, results)
-        return
-
-    flagged = [(d, lvl) for d, lvl, _ in results if lvl >= 1]
-    tp = [d for d, _ in flagged if d in EPISODES]
-    fp = [d for d, _ in flagged if d not in EPISODES and d not in BUFFER]
-
-    episode_days = [d for d in EPISODES
-                    if d in {h["date"] for h in history}]
-    episodes_hit = set(tp)
-
-    print(f"Loaded {len(history)} days: {history[0]['date']} → {history[-1]['date']}")
-    print(f"Confirmed sick (user report): {sorted(CONFIRMED_SICK)}")
-    print(f"Episodes (multi-signal clusters): {len(episode_days)} days")
-    print()
-    print(f"Flags: {len(flagged)}")
-    print(f"  True positives (episode days): {len(tp)}")
-    print(f"  False positives: {len(fp)}  → {sorted(fp)}")
-    print(f"  Adjacent-to-episode (ok): {len([d for d, _ in flagged if d not in EPISODES and d in BUFFER])}")
-    print()
-    print(f"Recall (episode days caught): {len(episodes_hit)}/{len(episode_days)} = {len(episodes_hit)/len(episode_days):.2f}")
-    healthy_n = len([d for d in history if d['date'] not in EPISODES])
-    print(f"False-positive rate: {len(fp)}/{healthy_n} healthy days = {len(fp)/healthy_n:.2f}")
-    print()
-    print(f"Confirmed sick window: day1 caught={any(d==sorted(CONFIRMED_SICK)[0] for d in tp)}  "
-          f"day3 caught={any(d==sorted(CONFIRMED_SICK)[-1] for d in tp)}")
-    print()
-    print("All flagged days:")
-    for d, lvl, detail in results:
-        if lvl >= 1:
-            tag = "EPISODE✓" if d in EPISODES else ("buffer" if d in BUFFER else "FP")
-            idx_line = [x for x in detail.split("\n") if "Strain index" in x]
-            print(f"  {d}  {sr.STRAIN_ICONS[lvl]:<24} {tag:<10} {idx_line[0] if idx_line else ''}")
+    parser = argparse.ArgumentParser(description=__doc__)
+    parser.add_argument("--db", default=os.environ.get("SYMPTOM_RADAR_DB", str(Path(__file__).with_name("ultrahuman.db"))),
+                        help="input database, always opened read-only")
+    parser.add_argument("--episodes", type=Path, default=EPISODES_FILE, help="personal annotations JSON")
+    parser.add_argument("--labels", action="store_true", help="show label separation analysis")
+    parser.add_argument("--json", action="store_true", help="print full results as one JSON object")
+    args = parser.parse_args()
+    result = evaluate_database(args.db, args.episodes)
+    if args.json:
+        print(json.dumps(result, sort_keys=True, allow_nan=False))
+    else:
+        print_summary(result, args.labels)
 
 
 if __name__ == "__main__":

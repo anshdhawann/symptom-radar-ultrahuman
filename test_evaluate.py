@@ -84,7 +84,7 @@ def test_unassessable_days_are_excluded_from_every_rate(tmp_path):
 
 def test_episode_window_one_day_gap_and_signed_onset_delay(tmp_path):
     dates = [str(dt.date(2024, 1, 1) + dt.timedelta(days=i)) for i in range(20)]
-    flags = {"2024-01-02", "2024-01-12", "2024-01-19"}
+    flags = {"2024-01-01", "2024-01-02", "2024-01-12", "2024-01-19"}
     positives = {"2024-01-04", "2024-01-06", "2024-01-11", "2024-01-12", "2024-01-18"}
     result = run(tmp_path, [(d, int(d in flags)) for d in dates],
                  {d: "sick" for d in positives})
@@ -139,3 +139,16 @@ def test_fingerprint_covers_scored_columns_and_not_unscored_columns(tmp_path):
         conn.execute("UPDATE daily_snapshots SET recovery_index=79")
     assert evaluate.evaluate_database(path, scorer=score)["input"]["sha256"] != first["sha256"]
     assert first["date_range"] == ["2024-01-01", "2024-01-01"]
+
+
+def test_real_engine_evaluation_on_synthetic_illness(tmp_path):
+    dates = [str(dt.date(2024, 1, 1) + dt.timedelta(days=i)) for i in range(33)]
+    path = database(tmp_path, [(d, 60 if i < 30 else 80) for i, d in enumerate(dates)],
+                    {d: "sick" for d in dates[30:]})
+    with sqlite3.connect(path) as conn:
+        conn.execute("UPDATE daily_snapshots SET avg_sleep_hrv=20, temp_deviation=1 WHERE date >= '2024-01-31'")
+    result = evaluate.evaluate_database(path)
+    assert result["status_counts"] == {"calibrating": 10, "ok": 23}
+    assert result["flagged_dates"] == ["2024-01-31", "2024-02-01", "2024-02-02"]
+    assert result["sections"]["illness"]["day_recall"] == {"numerator": 3, "n": 3, "value": 1.0}
+    assert result["sections"]["illness"]["episode_recall"] == {"numerator": 1, "n": 1, "value": 1.0}
