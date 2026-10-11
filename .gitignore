@@ -1,6 +1,7 @@
 *.db
 *.db-wal
 *.db-shm
+*.db.bak*
 *.pyc
 __pycache__/
 .env
