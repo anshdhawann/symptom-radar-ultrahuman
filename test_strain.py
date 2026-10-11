@@ -757,6 +757,16 @@ def test_empty_today_fetch_does_not_store_yesterday_steps(tmp_path, monkeypatch)
     conn.close()
 
 
+def test_structured_recovery_contribution_matches_total():
+    history = _flat_history()[:18]
+    for i, row in enumerate(history):
+        row["recovery_index"] = 70 + [-1, 0, 1][i % 3]
+    history += [{**history[0], "recovery_index": value} for value in [60, 50, 40]]
+    result = sr.assess_strain_result(history)
+    assert result["metrics"]["recovery"]["contribution"] == 0.55
+    assert result["strain_index"] == 0.55
+
+
 # ─── Tiny fallback runner (if pytest isn't installed) ───────────────────────
 def _collect():
     fns = [(n, getattr(sys.modules[__name__], n)) for n in dir(sys.modules[__name__])
