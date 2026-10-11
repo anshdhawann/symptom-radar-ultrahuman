@@ -795,6 +795,35 @@ def _dated_history(n=80, shift_at=None):
     return rows
 
 
+def test_weighted_stats_use_calendar_dates_for_absent_rows():
+    import pytest
+    series = [0.0] * 7 + [10.0]
+    dates = ["2020-01-01", "2020-01-02", "2020-01-03", "2020-01-04",
+             "2020-01-05", "2020-01-06", "2020-01-07", "2020-01-18"]
+    mean, _ = sr.rolling_stats_weighted(series, dates=dates, today="2020-01-22")
+    assert mean == pytest.approx(3.791958579196243)
+
+
+def test_wearer_midnight_preserves_dst_day_lengths(monkeypatch):
+    from datetime import date
+    monkeypatch.setenv("SYMPTOM_RADAR_TZ", "America/Edmonton")
+    spring = sr.wearer_midnight(date(2020, 3, 9)).timestamp() - sr.wearer_midnight(date(2020, 3, 8)).timestamp()
+    fall = sr.wearer_midnight(date(2020, 11, 2)).timestamp() - sr.wearer_midnight(date(2020, 11, 1)).timestamp()
+    assert spring == 82800
+    assert fall == 90000
+
+
+def test_baseline_builder_returns_exact_calendar_endpoints():
+    history = _dated_history(31)
+    history[5]["night_rhr"] = 999
+    history[27]["night_rhr"] = 999
+    baseline = sr.build_baseline(history)
+    assert baseline["rows"][0]["date"] == "2020-01-07"
+    assert baseline["rows"][-1]["date"] == "2020-01-27"
+    assert baseline["baseline_days"] == 21
+    assert abs(baseline["metrics"]["rhr"]["mean"] - 60.0) < 1e-9
+
+
 def test_calendar_baseline_does_not_reach_across_gaps():
     history = _dated_history(61)
     history = history[:30] + history[54:]
