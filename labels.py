@@ -2,21 +2,14 @@
 """
 Historical self-report labels for the Symptom Radar engine.
 
-These seed the daily_labels table with known history so evaluate.py can
-measure whether the model separates real sickness from strain.
+Read and collect real self-report labels in the configured database.
 
 Label meaning (used by the engine):
   fine  — felt normal
   rough — tired / stressed / poor sleep (strain WITHOUT illness)
   sick  — actually felt ill
 
-SEED_LABELS below are SYNTHETIC EXAMPLE DATA, provided so the file runs
-out of the box. Replace them with your own retrospective labels before
-using --seed on real data (see --from-memory / --review for collecting
-yours).
-
 Usage:
-    python3 labels.py --seed        # insert the seeds (idempotent)
     python3 labels.py               # print current labels
 """
 import argparse
@@ -25,44 +18,6 @@ import sys
 from datetime import datetime
 
 import symptom_radar as sr
-
-# (date, label, note, confidence)  — SYNTHETIC EXAMPLE DATA, replace freely
-SEED_LABELS = [
-    # ── Example confirmed sick window ───────────────────────────────────
-    ("2024-03-10", "sick",  "example: felt ill, low energy", "example"),
-    ("2024-03-11", "sick",  "example: still unwell (no ring data)", "example"),
-    ("2024-03-12", "sick",  "example: recovering, felt ill", "example"),
-    # ── Example strain (NOT illness) days ───────────────────────────────
-    ("2024-02-15", "rough", "example: poor sleep, tired (RHR elevated)", "example"),
-    ("2024-02-16", "rough", "example: rough day, low recovery", "example"),
-    ("2024-03-01", "rough", "example: stressed / poor sleep", "example"),
-    # ── Example fine days (healthy reference class) ─────────────────────
-    ("2024-02-01", "fine", "example: all vitals at personal mean", "example"),
-    ("2024-02-05", "fine", "example: all vitals at personal mean", "example"),
-    ("2024-02-08", "fine", "example: all vitals at personal mean", "example"),
-    ("2024-02-20", "fine", "example: all vitals at personal mean", "example"),
-    ("2024-02-27", "fine", "example: all vitals at personal mean", "example"),
-    ("2024-03-05", "fine", "example: all vitals at personal mean", "example"),
-]
-
-
-def seed(verbose=True):
-    """Insert SEED_LABELS idempotently. Returns count of new labels written."""
-    existing = {d for d, _, _ in sr.get_labels()}
-    added = 0
-    for date, label, note, _conf in SEED_LABELS:
-        if date in existing:
-            continue
-        sr.log_label(date, label, note)
-        added += 1
-        if verbose:
-            print(f"  + {date}: {label}  ({note})")
-    return added
-
-
-MIN_SICK = 15
-MIN_ROUGH = 15
-
 
 def review_candidates():
     """List candidate days worth labeling from memory.
@@ -153,6 +108,8 @@ def bulk_from_memory(text):
                 continue
             m = re.match(r"([a-z]{3})\.?\s+(\d{1,2})(?:-(\d{1,2}))?$", tok)
             if m:
+                if m.group(1) not in months:
+                    raise ValueError("Unknown month")
                 mon = months[m.group(1)]
                 day1 = int(m.group(2))
                 out.append(f"{year}-{mon:02d}-{day1:02d}")
@@ -185,11 +142,23 @@ def bulk_from_memory(text):
         seg = text_l[start:end]
         lm = label_re.search(seg)
         label = lm.group(1) if lm else None
-        for date in expand_dates([tok]):
+        try:
+            dates = expand_dates([tok])
+        except ValueError:
+            print("Invalid retrospective date. No labels added.")
+            return []
+        for date in dates:
             if date in seen:
                 continue
             seen.add(date)
             segments.append((date, label))
+
+    try:
+        for date, _ in segments:
+            datetime.strptime(date, "%Y-%m-%d")
+    except ValueError:
+        print("Invalid retrospective date. No labels added.")
+        return []
 
     logged = []
     for date, label in segments:
@@ -210,25 +179,12 @@ def bulk_from_memory(text):
 
 def status():
     """Print collection progress vs. the classifier's training threshold."""
-    labels = sr.get_labels()
-    counts = {"fine": 0, "rough": 0, "sick": 0}
-    for _, lbl, _ in labels:
-        counts[lbl] = counts.get(lbl, 0) + 1
-    print("Label collection status:")
-    print(f"  fine : {counts['fine']}")
-    print(f"  rough: {counts['rough']}  (need {MIN_ROUGH} → "
-          f"{max(0, MIN_ROUGH - counts['rough'])} more)")
-    print(f"  sick : {counts['sick']}  (need {MIN_SICK} → "
-          f"{max(0, MIN_SICK - counts['sick'])} more)")
-    print()
-    ready = counts["sick"] >= MIN_SICK and counts["rough"] >= MIN_ROUGH
-    if ready:
-        print("✅ Enough labels to train the separation classifier: "
-              "python3 train.py")
-    else:
-        print(f"Not ready to train yet: {max(0, MIN_SICK - counts['sick'])} more "
-              f"sick + {max(0, MIN_ROUGH - counts['rough'])} more rough days.")
-        print("The nightly 21:00 cron is collecting these automatically.")
+    import train
+    with sqlite3.connect(sr.DB_PATH) as conn:
+        cur = conn.execute("SELECT * FROM daily_snapshots ORDER BY date ASC")
+        cols = [d[0] for d in cur.description]
+        history = [dict(zip(cols, row)) for row in cur.fetchall()]
+    ready, _ = train.status_report(history)
     return ready
 
 
@@ -263,8 +219,6 @@ def run_verify():
 
 def main():
     ap = argparse.ArgumentParser(description="Historical self-report labels")
-    ap.add_argument("--seed", action="store_true",
-                    help="Insert the known historical labels (idempotent)")
     ap.add_argument("--status", action="store_true",
                     help="Show collection progress vs training threshold")
     ap.add_argument("--review", action="store_true",
@@ -285,23 +239,14 @@ def main():
         review_candidates()
     elif args.status:
         status()
-    elif args.seed:
-        n = seed()
-        print(f"\nSeeded {n} new labels ({len(SEED_LABELS)} known, "
-              f"{len(SEED_LABELS) - n} already present).")
     else:
         labels = sr.get_labels()
         if not labels:
-            print("No labels in DB. Run: python3 labels.py --seed")
+            print("No labels in DB. Collect real self-reports with --from-memory or --review.")
             return
-        print(f"{'Date':<12} {'Label':<8} Confidence   Note")
-        by_date = {d: (l, n) for d, l, n in labels}
-        for date, label, note, conf in SEED_LABELS:
-            print(f"{date:<12} {label:<8} {conf:<12} {note}")
-        # any extra labels beyond seeds
-        for date, label, note in labels:
-            if date not in by_date:
-                print(f"{date:<12} {label:<8} (logged)     {note or ''}")
+        print(f"{'Date':<12} {'Label':<8} Note")
+        for date, label, note in sorted(labels):
+            print(f"{date:<12} {label:<8} {note or ''}")
 
 
 if __name__ == "__main__":

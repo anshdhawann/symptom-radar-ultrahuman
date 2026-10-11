@@ -27,6 +27,7 @@ def test_future_marker_cannot_supply_early_baseline():
     for row in h[1:]:
         row['night_rhr'] = 99999
     assert tr.extract_features(h, 1) is None
+    h[30]['night_rhr'] = 60
     assert tr.extract_features(h, 30)['rhr_z'] < -1000
 
 
@@ -106,6 +107,59 @@ def test_memory_rejects_invalid_date_and_month_without_partial_write(tmp_path, m
     assert labels.bulk_from_memory('2020-02-01 sick, 2020-02-31 rough') == []
     assert labels.bulk_from_memory('xyz 22 sick') == []
     assert sr.get_labels() == []
+
+
+def test_episode_gate_rejects_many_days_in_one_episode(tmp_path, monkeypatch, capsys):
+    setup_db(tmp_path, monkeypatch)
+    h = history(120)
+    for i in range(30, 45):
+        sr.log_label(h[i]['date'], 'sick', 'synthetic sick fixture')
+    for i in range(60, 75):
+        sr.log_label(h[i]['date'], 'rough', 'synthetic rough fixture')
+    ready, counts = tr.status_report(h)
+    assert ready is False
+    assert counts == {'sick': 15, 'rough': 15, 'fine': 0}
+    out = capsys.readouterr().out
+    assert 'Independent assessable episodes: sick=1, rough=1' in out
+    assert 'Need 4 more sick episodes + 4 more rough episodes.' in out
+
+
+def test_episode_gate_accepts_five_episodes_per_class(tmp_path, monkeypatch, capsys):
+    setup_db(tmp_path, monkeypatch)
+    h = history(120)
+    for start in range(20, 70, 10):
+        for i in range(start, start + 3):
+            sr.log_label(h[i]['date'], 'sick', 'synthetic sick fixture')
+        for i in range(start + 5, start + 8):
+            sr.log_label(h[i]['date'], 'rough', 'synthetic rough fixture')
+    ready, counts = tr.status_report(h)
+    assert ready is True
+    assert counts == {'sick': 15, 'rough': 15, 'fine': 0}
+    out = capsys.readouterr().out
+    assert 'Independent assessable episodes: sick=5, rough=5' in out
+    assert 'Ready to train: collection gate met.' in out
+
+
+def test_memory_valid_range_writes_actual_labels(tmp_path, monkeypatch):
+    setup_db(tmp_path, monkeypatch)
+    year = labels.datetime.now().year
+    assert labels.bulk_from_memory('Jan 3-4 sick') == [
+        (f'{year}-01-03', 'sick'), (f'{year}-01-04', 'sick')]
+    assert sr.get_labels() == [
+        (f'{year}-01-03', 'sick', 'remembered retrospectively'),
+        (f'{year}-01-04', 'sick', 'remembered retrospectively')]
+
+
+def test_offline_cli_is_explicit_and_warns(tmp_path, monkeypatch):
+    db = setup_db(tmp_path, monkeypatch)
+    for script in ('train.py', 'scenario.py'):
+        path = str(Path(__file__).with_name(script))
+        env = {**os.environ, 'SYMPTOM_RADAR_DB': str(db), 'ULTRAHUMAN_TOKEN': 'dummy'}
+        live = subprocess.run([sys.executable, path], capture_output=True, text=True, env=env)
+        offline = subprocess.run([sys.executable, path, '--offline'], capture_output=True, text=True, env=env)
+        assert live.returncode == offline.returncode == 0
+        assert 'WARNING: --offline uses next-day recovery; results are not deployable.' in offline.stdout
+        assert 'WARNING: --offline' not in live.stdout
 
 
 def test_review_excludes_actual_labels(tmp_path, monkeypatch, capsys):
