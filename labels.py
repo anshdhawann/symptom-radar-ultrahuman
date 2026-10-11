@@ -17,7 +17,7 @@ import sqlite3
 import sys
 from datetime import datetime
 
-import symptom_radar as sr
+from symptomradar import config, engine, report as radar_report, storage
 
 def review_candidates():
     """List candidate days worth labeling from memory.
@@ -29,11 +29,11 @@ def review_candidates():
     prompts.
     """
     import datetime as _dt
-    conn = sqlite3.connect(sr.DB_PATH)
+    conn = sqlite3.connect(storage.DB_PATH)
     cur = conn.execute("SELECT * FROM daily_snapshots ORDER BY date ASC")
     cols = [d[0] for d in cur.description]
     all_days = [dict(zip(cols, r)) for r in cur.fetchall()]
-    already = {d for d, _, _ in sr.get_labels()}
+    already = {d for d, _, _ in storage.get_labels()}
     conn.close()
 
     print("Candidate days to label from memory (already-labeled excluded):")
@@ -48,7 +48,7 @@ def review_candidates():
         date = d["date"]
         if date in already:
             continue
-        lvl, detail = sr.assess_strain(all_days[:i + 1])
+        lvl, detail = engine.assess_strain(all_days[:i + 1])
         m_idx = re.search(r"Strain index: ([\d.]+)", detail)
         strain = float(m_idx.group(1)) if m_idx else 0.0
         # Show: flagged days (lvl>=1) + strain >= 0.5 (borderline-worthy)
@@ -58,7 +58,7 @@ def review_candidates():
         rhr = d.get("night_rhr") or d.get("sleep_rhr")
         temp = d.get("temp_deviation")
         temp_s = ("%+.2f" % temp) if temp is not None else "-"
-        hint = sr.STRAIN_ICONS.get(lvl, "") 
+        hint = radar_report.STRAIN_ICONS.get(lvl, "") 
         if "Recovery↓" in detail:
             hint += " rec-decline"
         print(f"{date:<12} {wd:<4} {str(rhr or '-'):>5} "
@@ -72,8 +72,8 @@ def review_candidates():
     print("  python3 symptom_radar.py --label <fine|rough|sick> "
           "--label-date YYYY-MM-DD --label-note 'remembered'")
     print("Target: 15 sick + 15 rough total (currently "
-          f"{sum(1 for _, l, _ in sr.get_labels() if l == 'sick')} sick / "
-          f"{sum(1 for _, l, _ in sr.get_labels() if l == 'rough')} rough).")
+          f"{sum(1 for _, l, _ in storage.get_labels() if l == 'sick')} sick / "
+          f"{sum(1 for _, l, _ in storage.get_labels() if l == 'rough')} rough).")
 
 def bulk_from_memory(text):
     """Parse a natural-language retrospective answer and log all labels.
@@ -99,7 +99,7 @@ def bulk_from_memory(text):
 
     def expand_dates(date_tokens):
         """Expand 'Mar 26-27' → ['<current-year>-03-26','<current-year>-03-27']."""
-        year = sr.wearer_now().year
+        year = config.wearer_now().year
         out = []
         for tok in date_tokens:
             m = re.match(r"(\d{4})-(\d{2})-(\d{2})$", tok)
@@ -165,7 +165,7 @@ def bulk_from_memory(text):
         if label is None:
             print(f"  ? {date}: no label found next to it — skipped")
             continue
-        sr.log_label(date, label, "remembered retrospectively")
+        storage.log_label(date, label, "remembered retrospectively")
         logged.append((date, label))
         print(f"  + {date}: {label}")
 
@@ -180,7 +180,7 @@ def bulk_from_memory(text):
 def status():
     """Print collection progress vs. the classifier's training threshold."""
     import train
-    with sqlite3.connect(sr.DB_PATH) as conn:
+    with sqlite3.connect(storage.DB_PATH) as conn:
         cur = conn.execute("SELECT * FROM daily_snapshots ORDER BY date ASC")
         cols = [d[0] for d in cur.description]
         history = [dict(zip(cols, row)) for row in cur.fetchall()]
@@ -199,7 +199,7 @@ def run_verify():
     """
     import subprocess, os
     here = os.path.dirname(os.path.abspath(__file__))
-    env = {**os.environ, "SYMPTOM_RADAR_DB": sr.DB_PATH}
+    env = {**os.environ, "SYMPTOM_RADAR_DB": storage.DB_PATH}
 
     print("=" * 78)
     print("FULL VERIFICATION CHAIN")
@@ -240,7 +240,7 @@ def main():
     elif args.status:
         status()
     else:
-        sr.print_labels()
+        storage.print_labels()
 
 
 if __name__ == "__main__":

@@ -12,10 +12,10 @@ import os
 from pathlib import Path
 
 import evaluate
-import symptom_radar as sr
+from symptomradar import engine, storage
 
 CANDIDATES = {
-    key: (key, lambda row, key=key: row.get(key) if sr._valid_metric_value(row.get(key)) else None, 0.10, True, key)
+    key: (key, lambda row, key=key: row.get(key) if storage._valid_metric_value(row.get(key)) else None, 0.10, True, key)
     for key in ("sleep_score", "spo2", "morning_alertness", "hr_drop")
 }
 
@@ -31,7 +31,7 @@ def ablate_database(db_path, episodes_path=None):
     default = evaluate.evaluate_database(db_path, episodes_path)
     results = {}
     for key, metric in CANDIDATES.items():
-        observed = {row["date"] for row in history if sr._valid_metric_value(row.get(key))}
+        observed = {row["date"] for row in history if storage._valid_metric_value(row.get(key))}
         entry = {"coverage": evaluate.rate(len(observed), len(history)),
                  "weight": metric[2], "direction": "low is strain", "noise_floor": 1.0}
         results[key] = entry
@@ -39,7 +39,7 @@ def ablate_database(db_path, episodes_path=None):
             entry["skipped"] = "No stored observations; cannot estimate a baseline or contribution"
             continue
         def scorer(rows, metric=metric):
-            return sr.assess_strain_result(rows, metrics=[*sr.STRAIN_METRICS, metric])
+            return engine.assess_strain_result(rows, metrics=[*engine.STRAIN_METRICS, metric])
         result = evaluate.evaluate_database(db_path, episodes_path, scorer=scorer)
         if result["input"] != default["input"]:
             raise ValueError("Input changed during ablation; repeat on a frozen snapshot")
