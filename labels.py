@@ -240,13 +240,7 @@ def main():
     elif args.status:
         status()
     else:
-        labels = sr.get_labels()
-        if not labels:
-            print("No labels in DB. Collect real self-reports with --from-memory or --review.")
-            return
-        print(f"{'Date':<12} {'Label':<8} Note")
-        for date, label, note in sorted(labels):
-            print(f"{date:<12} {label:<8} {note or ''}")
+        sr.print_labels()
 
 
 if __name__ == "__main__":

@@ -118,6 +118,15 @@ def init_db():
             fetched_at TEXT NOT NULL
         )
     """)
+    conn.execute("""
+        CREATE TABLE IF NOT EXISTS daily_confounders (
+            date TEXT PRIMARY KEY,
+            alcohol INTEGER CHECK (alcohol IS NULL OR (typeof(alcohol) = 'integer' AND alcohol >= 0)),
+            exercise INTEGER CHECK (exercise IS NULL OR exercise IN (0, 1)),
+            travel INTEGER CHECK (travel IS NULL OR travel IN (0, 1)),
+            sleep_loss INTEGER CHECK (sleep_loss IS NULL OR sleep_loss IN (0, 1))
+        )
+    """)
     conn.commit()
     return conn
 
@@ -129,20 +138,91 @@ def init_db():
 # RHR↑/HRV↓/Temp↑/Recovery↓ signature).
 LABELS = ("fine", "rough", "sick")
 
-def log_label(date_str, label, note=None):
-    """Record a daily self-report: 'fine' (normal), 'rough' (hangover/tired/
-    stressed), or 'sick' (actually felt ill). Idempotent per date — re-logging
-    a day overwrites the previous label."""
-    if label not in LABELS:
+CONFOUNDERS = ("alcohol", "exercise", "travel", "sleep_loss")
+
+
+def parse_confounders(value):
+    """Parse explicit exposure fields. Omitted fields remain unrecorded."""
+    if value is None:
+        return {}
+    if isinstance(value, str):
+        fields = {}
+        for item in value.split(","):
+            key, sep, raw = item.strip().partition("=")
+            if key in fields:
+                raise ValueError(f"Duplicate confounder: {key}")
+            if key == "alcohol":
+                if not sep or not raw.isascii() or not raw.isdigit():
+                    raise ValueError("alcohol must be a non-negative integer drink count")
+                fields[key] = int(raw)
+            elif key in CONFOUNDERS:
+                if sep and raw not in ("true", "false"):
+                    raise ValueError(f"{key} must be true or false")
+                fields[key] = raw != "false"
+            else:
+                raise ValueError(f"Unknown confounder: {key}")
+        value = fields
+    if not isinstance(value, dict):
+        raise ValueError("confounders must be a string or object")
+    for key, val in value.items():
+        if key not in CONFOUNDERS:
+            raise ValueError(f"Unknown confounder: {key}")
+        if key == "alcohol":
+            if type(val) is not int or val < 0:
+                raise ValueError("alcohol must be a non-negative integer drink count")
+        elif type(val) is not bool:
+            raise ValueError(f"{key} must be true or false")
+    return dict(value)
+
+
+def log_label(date_str, label, note=None, confounders=None):
+    """Atomically log a feeling and/or exposures. Supplied fields overwrite."""
+    datetime.strptime(date_str, "%Y-%m-%d")
+    if label is not None and label not in LABELS:
         raise ValueError(f"label must be one of {LABELS}, got {label!r}")
+    fields = parse_confounders(confounders)
+    if label is None and not fields:
+        raise ValueError("Provide a label or confounders")
     conn = init_db()
-    conn.execute(
-        "INSERT OR REPLACE INTO daily_labels (date, label, note) VALUES (?,?,?)",
-        (date_str, label, note),
-    )
-    conn.commit()
-    conn.close()
+    try:
+        with conn:
+            if label is not None:
+                conn.execute(
+                    "INSERT OR REPLACE INTO daily_labels (date, label, note) VALUES (?,?,?)",
+                    (date_str, label, note))
+            if fields:
+                keys = list(fields)
+                conn.execute(
+                    f"INSERT INTO daily_confounders (date, {', '.join(keys)}) "
+                    f"VALUES ({', '.join('?' for _ in range(len(keys) + 1))}) "
+                    f"ON CONFLICT(date) DO UPDATE SET {', '.join(f'{k}=excluded.{k}' for k in keys)}",
+                    [date_str, *fields.values()])
+    finally:
+        conn.close()
     return True
+
+
+def get_confounders():
+    conn = init_db()
+    try:
+        return {row[0]: {key: (val if key == "alcohol" or val is None else bool(val))
+                         for key, val in zip(CONFOUNDERS, row[1:])}
+                for row in conn.execute("SELECT date, alcohol, exercise, travel, sleep_loss FROM daily_confounders ORDER BY date")}
+    finally:
+        conn.close()
+
+
+def print_labels():
+    labels = {day: (label, note) for day, label, note in get_labels()}
+    confounders = get_confounders()
+    if not labels and not confounders:
+        print("No labels or confounders logged yet.")
+        return
+    print(f"{'Date':<12} {'Label':<10} Note | Confounders")
+    for day in sorted(labels.keys() | confounders.keys()):
+        label, note = labels.get(day, ("unlabeled", None))
+        fields = ",".join(f"{key}={str(val).lower()}" for key, val in confounders.get(day, {}).items() if val is not None)
+        print(f"{day:<12} {label:<10} {note or ''} | {fields}")
 
 def get_labels():
     """Return [(date, label, note), ...] ordered by date."""
@@ -451,7 +531,7 @@ def _calendar_window(history, first_age, last_age):
     return [day for day in history if start <= day["date"] <= end]
 
 
-def build_baseline(history):
+def build_baseline(history, metrics=None):
     """Label-blind, non-recursive clean baseline for the last dated snapshot.
 
     The window is the BASELINE_WINDOW calendar days ending CLEAN_GUARD days
@@ -464,13 +544,14 @@ def build_baseline(history):
     excursions in the healthy direction, stay in so the noise estimate is not
     trimmed.
     """
+    metrics = STRAIN_METRICS if metrics is None else metrics
     history = _calendar_rows(history)
     pool = _calendar_window(history, CLEAN_GUARD, CLEAN_GUARD + BASELINE_WINDOW - 1)
     references = []
-    for _key, extract, weight, inverted, _label in STRAIN_METRICS:
+    for _key, extract, weight, inverted, _label in metrics:
         series = [extract(day) for day in pool]
         if sum(value is not None for value in series) >= 7:
-            noise = max(1.4826 * median_abs_deviation(series), MIN_NOISE[_key])
+            noise = max(1.4826 * median_abs_deviation(series), MIN_NOISE.get(_key, 1.0))
             references.append((_median(series), noise, extract, weight, inverted))
 
     def illness_grade(day):
@@ -485,18 +566,18 @@ def build_baseline(history):
     pool = [day for day in pool if not illness_grade(day)]
     dates = [day["date"] for day in pool]
     today = history[-1]["date"] if history else None
-    metrics = {}
-    for key, extract, weight, inverted, _label in STRAIN_METRICS:
+    metric_baselines = {}
+    for key, extract, weight, inverted, _label in metrics:
         series = [extract(day) for day in pool]
         mean, noise = _baseline_stats(series, dates, today)
         if noise is not None:
-            noise = max(noise, MIN_NOISE[key])
-        metrics[key] = {"mean": mean, "noise": noise, "weight": weight,
+            noise = max(noise, MIN_NOISE.get(key, 1.0))
+        metric_baselines[key] = {"mean": mean, "noise": noise, "weight": weight,
                         "inverted": inverted, "extract": extract}
     baseline_days = sum(
         sum(extract(day) is not None for _, extract, *_ in STRAIN_METRICS) >= 2
         for day in pool)
-    return {"rows": pool, "metrics": metrics, "baseline_days": baseline_days}
+    return {"rows": pool, "metrics": metric_baselines, "baseline_days": baseline_days}
 
 
 def _day_level_score(day, metric_baselines):
@@ -529,7 +610,7 @@ def assess_strain(history):
     return result["level"] if result["level"] is not None else 0, result["detail"]
 
 
-def assess_strain_result(history):
+def assess_strain_result(history, metrics=None):
     """
     TemPredict-inspired strain detection (RR-free adaptation).
 
@@ -559,15 +640,16 @@ def assess_strain_result(history):
     Normal requires two assessable core metrics. Partial elevation is retained.
     """
     history = _calendar_rows(history)
+    metrics = STRAIN_METRICS if metrics is None else metrics
     today = history[-1] if history else {}
     coverage = [key for key, extract, *_ in STRAIN_METRICS if extract(today) is not None]
-    baseline = build_baseline(history)
+    baseline = build_baseline(history, metrics=metrics)
     baseline_pool = baseline["rows"]
     baseline_days = baseline["baseline_days"]
     result = {"status": "no_data", "level": None, "strain_index": None,
               "elevated_recent": None,
               "metrics": {key: {"z": None, "z_slope": None, "contribution": None}
-                          for key, *_ in STRAIN_METRICS}, "coverage": coverage,
+                          for key, *_ in metrics}, "coverage": coverage,
               "baseline_days": baseline_days, "detail": "No core metrics for today"}
     if not coverage:
         return result
@@ -583,7 +665,7 @@ def assess_strain_result(history):
     metric_details = {}
     assessable = []
 
-    for key, _extract, _weight, inverted, label in STRAIN_METRICS:
+    for key, _extract, _weight, inverted, label in metrics:
         mb = metric_baselines[key]
         mean, noise = mb["mean"], mb["noise"]
         recent_series = [mb["extract"](d) for d in recent]
@@ -592,7 +674,8 @@ def assess_strain_result(history):
         metric_details[key] = {"z": None, "z_slope": None, "contribution": None}
         if mean is None or noise is None or noise == 0 or today_val is None:
             continue
-        assessable.append(key)
+        if key in {metric[0] for metric in STRAIN_METRICS}:
+            assessable.append(key)
 
         # Level z (today vs clean baseline, noise-normalized → strain direction)
         # Strain MAGNITUDE is always positive: for inverted metrics (HRV), the
@@ -1034,8 +1117,13 @@ def _mcp_handle(method, params):
                                   "description": "fine=normal, rough=hangover/tired/stressed, sick=actually felt ill"},
                         "date": {"type": "string", "description": "YYYY-MM-DD (defaults to today in the wearer timezone)"},
                         "note": {"type": "string", "description": "Optional context, e.g. 'hangover' or 'fever'"},
+                        "confounders": {"type": "string", "description": "alcohol=3,exercise,travel,sleep_loss; use =false or alcohol=0 for explicit absence. exercise means hard exercise."},
+                        "alcohol": {"type": "integer", "minimum": 0},
+                        "exercise": {"type": "boolean", "description": "Hard exercise"},
+                        "travel": {"type": "boolean"},
+                        "sleep_loss": {"type": "boolean"},
                     },
-                    "required": ["label"],
+                    "anyOf": [{"required": [field]} for field in ("label", "confounders", *CONFOUNDERS)],
                 },
             },
             {
@@ -1090,13 +1178,22 @@ def _mcp_handle(method, params):
         if name == "symptom_radar_label":
             date_str = str(args.get("date") or
                           wearer_now().strftime("%Y-%m-%d"))
-            label = str(args.get("label") or "")
-            if label not in LABELS:
-                return None, f"label must be one of {LABELS}"
+            label = args.get("label")
             note = args.get("note")
-            log_label(date_str, label, note)
+            try:
+                unknown = args.keys() - {"label", "date", "note", "confounders", *CONFOUNDERS}
+                if unknown:
+                    raise ValueError(f"Unknown label or confounder fields: {sorted(unknown)}")
+                fields = parse_confounders(args.get("confounders"))
+                direct = parse_confounders({key: args[key] for key in CONFOUNDERS if key in args})
+                if fields.keys() & direct.keys():
+                    raise ValueError("Duplicate confounder fields")
+                fields.update(direct)
+                log_label(date_str, label, note, confounders=fields)
+            except (ValueError, TypeError) as exc:
+                return None, str(exc)
             return {"content": [{"type": "text", "text": json.dumps({
-                "logged": date_str, "label": label, "note": note,
+                "logged": date_str, "label": label, "note": note, "confounders": fields,
             })}]}, None
         if name == "symptom_radar_labels":
             return {"content": [{"type": "text",
@@ -1172,6 +1269,7 @@ if __name__ == "__main__":
                         help="Date for --label (defaults to today in the wearer timezone)")
     parser.add_argument("--label-note", metavar="TEXT", default=None,
                         help="Optional note for --label (e.g. 'hangover', 'fever')")
+    parser.add_argument("--confounders", help="alcohol=3,exercise,travel,sleep_loss (exercise means hard exercise); =false or alcohol=0 records absence")
     parser.add_argument("--labels", action="store_true",
                         help="Print all logged self-report labels")
     args = parser.parse_args()
@@ -1180,22 +1278,17 @@ if __name__ == "__main__":
         run_mcp_server()
     elif args.backfill:
         backfill(args.backfill)
-    elif args.label:
+    elif args.label or args.confounders is not None:
         date_str = args.label_date or wearer_now().strftime("%Y-%m-%d")
-        log_label(date_str, args.label, args.label_note)
-        print(f"✅ Logged {date_str}: {args.label}"
-              + (f" ({args.label_note})" if args.label_note else ""))
-        print("   Tip: run daily — 'fine', 'rough', or 'sick'. A few months of "
-              "labels lets the engine separate real illness from alcohol strain.")
+        try:
+            log_label(date_str, args.label, args.label_note, confounders=args.confounders)
+        except ValueError as exc:
+            parser.error(str(exc))
+        print(f"✅ Logged {date_str}: {args.label or 'unlabeled'}"
+              + (f" ({args.label_note})" if args.label_note else "")
+              + (f" | {args.confounders}" if args.confounders else ""))
     elif args.labels:
-        labels = get_labels()
-        if not labels:
-            print("No labels logged yet. Use --label fine|rough|sick (e.g. "
-                  "python3 symptom_radar.py --label rough).")
-        else:
-            print(f"{'Date':<12} {'Label':<8} Note")
-            for d, lbl, note in labels:
-                print(f"{d:<12} {lbl:<8} {note or ''}")
+        print_labels()
     else:
         report = build_report()
         print(report)
