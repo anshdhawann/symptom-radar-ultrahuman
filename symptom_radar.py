@@ -393,7 +393,7 @@ def _baseline_stats(baseline_series):
 # automatically if Ultrahuman starts returning it; until then it would only
 # contribute 0, so it's kept out of the active weight distribution.
 STRAIN_METRICS = [
-    ("rhr",  lambda d: d.get("night_rhr") or d.get("sleep_rhr"), 0.25, False, "RHR"),
+    ("rhr",  lambda d: d.get("night_rhr") if d.get("night_rhr") is not None else d.get("sleep_rhr"), 0.25, False, "RHR"),
     ("hrv",  lambda d: d.get("avg_sleep_hrv"),                    0.30, True,  "HRV"),
     ("temp", lambda d: d.get("temp_deviation"),                   0.45, False, "Temp Δ"),
 ]
@@ -517,12 +517,14 @@ def assess_strain(history):
         # look +0.5σ elevated and letting the reversion slope through.
         slope = linear_slope(recent_series, [d.get("date") for d in recent])
         if slope is not None:
-            gate_ref = _median([mb["extract"](d) for d in baseline_pool]) or mean
+            gate_ref = _median([mb["extract"](d) for d in baseline_pool])
+            if gate_ref is None:
+                gate_ref = mean
             z_level_gate = (today_val - gate_ref) / noise
             z_level_gate_s = -z_level_gate if inverted else z_level_gate
             if z_level_gate_s > MIN_SLOPE_LEVEL:
                 z_slope = (slope * TRAJ_WINDOW) / noise
-                z_slope_s = abs(z_slope) if inverted else max(0.0, z_slope)
+                z_slope_s = max(0.0, -z_slope if inverted else z_slope)
             else:
                 z_slope_s = 0.0  # rising back toward typical — not strain
         else:
