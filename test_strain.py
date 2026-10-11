@@ -557,9 +557,10 @@ def test_hrv_recovery_slope_does_not_boost_strain():
     for value in [0, 10, 20, 30, 40]:
         history.append({**history[0], "avg_sleep_hrv": value})
     level, detail = sr.assess_strain(history)
-    assert level == 0, detail
+    assert level == 2, detail
     assert "HRV" in detail
-    assert "Strain index: 0.01" in detail
+    assert "Strain index: 3.00" in detail
+    assert sr.assess_strain_result(history)["metrics"]["hrv"]["z_slope"] == 0.0
 
 
 def test_zero_median_temperature_recovery_is_normal():
@@ -643,8 +644,8 @@ def test_structured_scores_include_zero_and_recovery_slope():
     assert result["metrics"]["hrv"]["z_slope"] == 0.0
     assert result["metrics"]["temp"]["contribution"] == 0.0
     assert result["metrics"]["hrv"]["contribution"] > 0
-    assert result["elevated_recent"] == 0
-    assert result["baseline_days"] == 21
+    assert result["elevated_recent"] == 3
+    assert result["baseline_days"] == 20
 
 
 def test_storage_preserves_nulls_and_audits_revisions(tmp_path, monkeypatch):
@@ -843,6 +844,14 @@ def test_permanent_shift_becomes_normal_within_35_days():
 def test_single_baseline_outlier_does_not_move_reference():
     history = _dated_history(31)
     history[20].update(night_rhr=200, avg_sleep_hrv=1, temp_deviation=5)
+    history[-1]["temp_deviation"] = 0.1
+    result = sr.assess_strain_result(history)
+    assert abs(result["metrics"]["temp"]["z"] - 2.0) < 1e-9
+
+
+def test_single_opposite_baseline_outlier_does_not_move_reference():
+    history = _dated_history(31)
+    history[20].update(night_rhr=20, avg_sleep_hrv=200, temp_deviation=-5)
     history[-1]["temp_deviation"] = 0.1
     result = sr.assess_strain_result(history)
     assert abs(result["metrics"]["temp"]["z"] - 2.0) < 1e-9

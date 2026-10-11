@@ -183,9 +183,9 @@ def test_training_uses_engine_noise_floor_and_exact_scores():
         row.update(night_rhr=60, avg_sleep_hrv=50, temp_deviation=0.0)
     h[-1].update(night_rhr=64, avg_sleep_hrv=45, temp_deviation=0.1)
     feats = tr.extract_features(h, 30)
-    assert feats['rhr_z'] == 4.0
-    assert feats['hrv_z'] == 5.0
-    assert feats['temp_z'] == 2.0
+    assert abs(feats['rhr_z'] - 4.0) < 1e-9
+    assert abs(feats['hrv_z'] - 5.0) < 1e-9
+    assert abs(feats['temp_z'] - 2.0) < 1e-9
     assert feats['strain_idx'] == sr.assess_strain_result(h)['strain_index']
     assert feats['elevated_3d'] == 1
 
