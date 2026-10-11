@@ -93,6 +93,16 @@ def init_db():
             created_at TEXT DEFAULT (datetime('now'))
         )
     """)
+    conn.execute("""
+        CREATE TABLE IF NOT EXISTS metric_revisions (
+            id INTEGER PRIMARY KEY,
+            date TEXT NOT NULL,
+            field TEXT NOT NULL,
+            old_value REAL NOT NULL,
+            new_value REAL NOT NULL,
+            fetched_at TEXT NOT NULL
+        )
+    """)
     conn.commit()
     return conn
 
@@ -200,44 +210,40 @@ def extract_steps_total(metrics):
     return None
 
 # ─── Storage ──────────────────────────────────────────────────────────────────
+def _valid_metric_value(value):
+    return (isinstance(value, (int, float)) and not isinstance(value, bool)
+            and math.isfinite(value))
+
+
 def store_snapshot(conn, date_str, data):
-    conn.execute("""
-        INSERT OR REPLACE INTO daily_snapshots
-        (date, sleep_score, total_sleep_min, sleep_efficiency,
-         deep_sleep_min, light_sleep_min, rem_sleep_min,
-         temp_deviation, avg_body_temp, night_rhr, sleep_rhr,
-         avg_sleep_hrv, recovery_index, movement_index,
-         active_minutes, inactive_time, total_steps, vo2_max,
-         spo2, tosses_and_turns, full_sleep_cycles, restorative_sleep,
-         hr_drop, morning_alertness)
-        VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)
-    """, (
-        date_str,
-        data.get("sleep_score"),
-        data.get("total_sleep_min"),
-        data.get("sleep_efficiency"),
-        data.get("deep_sleep_min"),
-        data.get("light_sleep_min"),
-        data.get("rem_sleep_min"),
-        data.get("temp_deviation"),
-        data.get("avg_body_temp"),
-        data.get("night_rhr"),
-        data.get("sleep_rhr"),
-        data.get("avg_sleep_hrv"),
-        data.get("recovery_index"),
-        data.get("movement_index"),
-        data.get("active_minutes"),
-        data.get("inactive_time"),
-        data.get("total_steps"),
-        data.get("vo2_max"),
-        data.get("spo2"),
-        data.get("tosses_and_turns"),
-        data.get("full_sleep_cycles"),
-        data.get("restorative_sleep"),
-        data.get("hr_drop"),
-        data.get("morning_alertness"),
-    ))
-    conn.commit()
+    columns = [r[1] for r in conn.execute("PRAGMA table_info(daily_snapshots)")
+               if r[1] not in ("date", "created_at")]
+    values = {key: data[key] for key in columns
+              if _valid_metric_value(data.get(key))}
+    if not values:
+        return False
+    with conn:
+        if not conn.in_transaction:
+            conn.execute("BEGIN IMMEDIATE")
+        cur = conn.execute("SELECT * FROM daily_snapshots WHERE date=?", (date_str,))
+        row = cur.fetchone()
+        previous = dict(zip([d[0] for d in cur.description], row)) if row else {}
+        fetched_at = datetime.now(timezone.utc).isoformat()
+        for field, value in values.items():
+            old_value = previous.get(field)
+            if old_value is not None and old_value != value:
+                conn.execute(
+                    "INSERT INTO metric_revisions "
+                    "(date, field, old_value, new_value, fetched_at) VALUES (?,?,?,?,?)",
+                    (date_str, field, old_value, value, fetched_at))
+        fields = list(values)
+        updates = ", ".join(f"{field}=excluded.{field}" for field in fields)
+        placeholders = ", ".join("?" for _ in range(len(fields) + 1))
+        conn.execute(
+            f"INSERT INTO daily_snapshots (date, {', '.join(fields)}) "
+            f"VALUES ({placeholders}) ON CONFLICT(date) DO UPDATE SET {updates}",
+            [date_str] + [values[field] for field in fields])
+    return True
 
 def get_recent(conn, days=30):
     cur = conn.execute("""
@@ -427,6 +433,15 @@ def _day_level_score(day, metric_baselines):
     return total
 
 def assess_strain(history):
+    """Legacy tuple adapter for evaluate.py and train.py. Unknown is unflagged.
+
+    Use assess_strain_result for status-aware decisions.
+    """
+    result = assess_strain_result(history)
+    return result["level"] if result["level"] is not None else 0, result["detail"]
+
+
+def assess_strain_result(history):
     """
     TemPredict-inspired strain detection (RR-free adaptation).
 
@@ -453,21 +468,28 @@ def assess_strain(history):
        the single biggest false-positive reducer (filters hangover, exercise,
        one bad night of sleep).
 
-    Returns:
-        level (int): 0 = Normal, 1 = Elevated, 2 = Significant strain
-        detail (str): Human-readable breakdown
+    Returns a structured dictionary with status, optional level (0/1/2),
+    strain_index, elevated_recent, metrics, coverage, baseline_days, and detail.
+    Status is one of ok, no_data, calibrating, or insufficient_data.
+    Normal requires two assessable core metrics. Partial elevation is retained.
     """
-    if len(history) < MIN_HISTORY:
-        return 0, f"Need {MIN_HISTORY}+ days of data for a clean baseline"
-
-    # ── Clean baseline: exclude last CLEAN_GUARD days ──
+    today = history[-1] if history else {}
+    coverage = [key for key, extract, *_ in STRAIN_METRICS if extract(today) is not None]
     baseline_pool = history[:-CLEAN_GUARD] if len(history) > CLEAN_GUARD else []
-    if len(baseline_pool) > BASELINE_WINDOW:
-        baseline_pool = baseline_pool[-BASELINE_WINDOW:]
-    if len(baseline_pool) < 7:
-        return 0, "Insufficient clean baseline days"
-
-    today = history[-1]
+    baseline_pool = baseline_pool[-BASELINE_WINDOW:]
+    baseline_days = sum(
+        sum(extract(day) is not None for _, extract, *_ in STRAIN_METRICS) >= 2
+        for day in baseline_pool)
+    result = {"status": "no_data", "level": None, "strain_index": None,
+              "elevated_recent": None,
+              "metrics": {key: {"z": None, "z_slope": None, "contribution": None}
+                          for key, *_ in STRAIN_METRICS}, "coverage": coverage,
+              "baseline_days": baseline_days, "detail": "No core metrics for today"}
+    if not coverage:
+        return result
+    if len(history) < MIN_HISTORY or baseline_days < 7:
+        result.update(status="calibrating", detail="Insufficient clean baseline days")
+        return result
     recent = history[-TRAJ_WINDOW:]
 
     # ── Precompute baseline stats per metric (done once, reused for persistence) ──
@@ -484,6 +506,8 @@ def assess_strain(history):
 
     scores = {}
     contributions = []
+    metric_details = {}
+    assessable = []
 
     for key, _extract, _weight, inverted, label in STRAIN_METRICS:
         mb = metric_baselines[key]
@@ -491,8 +515,10 @@ def assess_strain(history):
         recent_series = [mb["extract"](d) for d in recent]
         today_val = mb["extract"](today)
 
+        metric_details[key] = {"z": None, "z_slope": None, "contribution": None}
         if mean is None or noise is None or noise == 0 or today_val is None:
             continue
+        assessable.append(key)
 
         # Level z (today vs clean baseline, noise-normalized → strain direction)
         # Strain MAGNITUDE is always positive: for inverted metrics (HRV), the
@@ -533,6 +559,8 @@ def assess_strain(history):
         # Blend: max of level and trend (trend as boost, not dilution)
         z_blend = max(z_level_s, z_slope_s)
 
+        metric_details[key] = {"z": z_level, "z_slope": z_slope_s,
+                               "contribution": z_blend * mb["weight"]}
         if z_blend > 0:
             scores[key] = z_blend * mb["weight"]
             arrow = "↓" if inverted else "↑"
@@ -547,8 +575,10 @@ def assess_strain(history):
     rec_series = [d.get("recovery_index") for d in baseline_pool]
     rec_mean, rec_noise = _baseline_stats(rec_series)
     today_rec = today.get("recovery_index")
+    metric_details["recovery"] = {"z": None, "z_slope": None, "contribution": None}
     if rec_mean is not None and rec_noise is not None and rec_noise > 0 and today_rec is not None:
         z_rec = (today_rec - rec_mean) / rec_noise
+        metric_details["recovery"] = {"z": z_rec, "z_slope": 0.0, "contribution": 0.0}
         # Level deficit: recovery already well below baseline
         if z_rec < -1.0:
             scores["recovery_mod"] = min(abs(z_rec) * 0.10, 0.30)
@@ -563,12 +593,13 @@ def assess_strain(history):
         rec_slope = linear_slope(recent_rec, [d.get("date") for d in history[-3:]])
         if rec_slope is not None and rec_slope < 0:
             z_rec_slope_s = -(rec_slope * 3) / rec_noise   # 3-day drop in σ, + = strain
+            metric_details["recovery"]["z_slope"] = z_rec_slope_s
             if z_rec_slope_s > 1.0:
                 scores["recovery_trend"] = min(z_rec_slope_s * 0.08, 0.25)
                 contributions.append(f"Recovery↓ {today_rec} ({rec_slope:+.0f}/day)")
 
-    if not scores:
-        return 0, "Biometrics within normal range"
+        metric_details["recovery"]["contribution"] = (
+            scores.get("recovery_mod", 0.0) + scores.get("recovery_trend", 0.0))
 
     strain_today = sum(scores.values())
 
@@ -594,12 +625,14 @@ def assess_strain(history):
     # 2 = Significant: strong (>= 2.0) AND sustained (>= 2 of last 3 days elevated)
     # 1 = Elevated: notable single-day deviation (worth watching — the "Oura flag")
     # 0 = Normal
-    if strain_today >= 2.0 and elevated_days >= 2:
-        return 2, detail
-    elif strain_today >= 1.0:
-        return 1, detail
-    else:
-        return 0, detail
+    level = 2 if strain_today >= 2.0 and elevated_days >= 2 else 1 if strain_today >= 1.0 else 0
+    status = "ok"
+    if level == 0 and len(assessable) < 2:
+        status = "calibrating" if len(coverage) >= 2 else "insufficient_data"
+        level = None
+    result.update(status=status, level=level, strain_index=strain_today,
+                  elevated_recent=elevated_days, metrics=metric_details, detail=detail)
+    return result
 
 # ─── Report ───────────────────────────────────────────────────────────────────
 STRAIN_ICONS = {0: "✅ Normal", 1: "🟡 Elevated", 2: "🔴 Significant strain"}
@@ -657,7 +690,9 @@ def build_report():
     t_temp = extract_metric(t_metrics, "temp")
     y_steps = extract_steps_total(y_metrics)
 
-    rhr_val = (t_sleep_rhr or {}).get("value") or (t_night_rhr or {}).get("avg")
+    rhr_val = (t_sleep_rhr or {}).get("value")
+    if rhr_val is None:
+        rhr_val = (t_night_rhr or {}).get("avg")
     hrv_val = (t_sleep_hrv or {}).get("value")
 
     # Store snapshot
@@ -686,19 +721,31 @@ def build_report():
         "full_sleep_cycles": (sleep_raw or {}).get("full_sleep_cycles"),
         "restorative_sleep": (sleep_raw or {}).get("restorative_sleep"),
     }
-    store_snapshot(conn, t_str, snapshot)
+    snapshot = {key: value if _valid_metric_value(value) else None
+                for key, value in snapshot.items()}
+    if any(value is not None for key, value in snapshot.items() if key != "total_steps"):
+        store_snapshot(conn, t_str, snapshot)
 
     # Strain assessment
-    history = get_recent(conn, 30)
-    strain_level, strain_detail = assess_strain(history)
+    history = [day for day in get_recent(conn, 30) if day["date"] < t_str]
+    assessment = assess_strain_result(history + [{"date": t_str, **snapshot}])
+    strain_level, strain_detail = assessment["level"], assessment["detail"]
 
     # Build report
     parts = ["## 🩸 Ultrahuman Daily"]
 
     # Symptom Radar (top)
     parts.append(f"\n**🦠 Symptom Radar**")
-    parts.append(f"**{STRAIN_ICONS[strain_level]}**")
-    if strain_level > 0:
+    if assessment["status"] == "ok":
+        verdict = STRAIN_ICONS[strain_level]
+    elif assessment["status"] == "no_data":
+        verdict = "⚪ No data: ring not synced"
+    elif assessment["status"] == "calibrating":
+        verdict = f"⏳ Calibrating: {assessment['baseline_days']} of 7 clean baseline days"
+    else:
+        verdict = f"⚪ Insufficient data: {len(assessment['coverage'])} of 3 core metrics"
+    parts.append(f"**{verdict}**")
+    if strain_level is not None and strain_level > 0:
         parts.append(f"`{strain_detail}`")
     if strain_level == 1:
         parts.append("🟡 *Elevated deviations — worth watching today*")
@@ -955,14 +1002,14 @@ def _mcp_handle(method, params):
             return {"content": [{"type": "text", "text": json.dumps(rows, indent=2)}]}, None
         if name == "symptom_radar_strain":
             conn = init_db()
-            history = get_recent(conn, 30)
+            today = datetime.now().strftime("%Y-%m-%d")
+            history = [day for day in get_recent(conn, 30) if day["date"] <= today]
             conn.close()
-            level, detail = assess_strain(history)
-            return {"content": [{"type": "text", "text": json.dumps({
-                "level": level,
-                "level_label": STRAIN_ICONS.get(level),
-                "detail": detail,
-            }, indent=2)}]}, None
+            if not history or history[-1]["date"] != today:
+                history.append({"date": today})
+            result = assess_strain_result(history)
+            result["level_label"] = STRAIN_ICONS.get(result["level"])
+            return {"content": [{"type": "text", "text": json.dumps(result, indent=2)}]}, None
         if name == "symptom_radar_label":
             date_str = str(args.get("date") or
                           datetime.now().strftime("%Y-%m-%d"))
