@@ -675,6 +675,10 @@ def build_report():
             sleep_raw = extract_sleep_summary(m.get("object", {}))
             break
 
+    if sleep_raw is not None:
+        sleep_raw = {key: value if _valid_metric_value(value) else None
+                     for key, value in sleep_raw.items()}
+
     t_night_rhr = extract_metric(t_metrics, "night_rhr")
     t_sleep_rhr = extract_metric(t_metrics, "sleep_rhr")
     t_sleep_hrv = extract_metric(t_metrics, "avg_sleep_hrv")
