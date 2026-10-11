@@ -79,3 +79,23 @@ def test_offline_mcp_tools_without_token(checkout):
     responses = [json.loads(line) for line in result.stdout.splitlines()]
     assert len(responses) == 3
     assert all("result" in response for response in responses)
+
+
+def test_pyproject_console_entry_point(monkeypatch, capsys):
+    tomllib = pytest.importorskip("tomllib")
+    project = tomllib.loads(Path(__file__).with_name("pyproject.toml").read_text())
+    assert project["build-system"]["build-backend"] == "setuptools.build_meta"
+    assert project["project"]["name"] == "symptom-radar-ultrahuman"
+    assert project["project"]["requires-python"] == ">=3.10"
+    assert project["project"]["dependencies"] == ["requests>=2.28"]
+    assert project["project"]["optional-dependencies"]["test"] == ["pytest"]
+    entry = project["project"]["scripts"]["symptom-radar"]
+    assert entry == "symptomradar.cli:main"
+    module, name = entry.split(":")
+    main = getattr(importlib.import_module(module), name)
+    monkeypatch.delenv("ULTRAHUMAN_TOKEN", raising=False)
+    monkeypatch.setattr(sys, "argv", ["symptom-radar", "--help"])
+    with pytest.raises(SystemExit) as exc:
+        main()
+    assert exc.value.code == 0
+    assert "Symptom Radar for Ultrahuman Ring" in capsys.readouterr().out
