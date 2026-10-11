@@ -5,3 +5,6 @@
 __pycache__/
 .env
 episodes.json*
+*.egg-info/
+build/
+dist/

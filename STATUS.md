@@ -13,16 +13,19 @@ privacy-preserving alternative to commercial symptom-radar products.
 
 | Item | Evidence |
 |---|---|
-| Strain engine: calendar-aligned clean baseline (the 21 days ending 3 days before today, median/MAD reference), illness-grade days kept out of their own baseline, trajectory boost, persistence, per-metric noise floors | engine and its tests |
+| Strain engine: calendar-aligned clean baseline (the 21 days ending 3 days before today, median/MAD reference), illness-grade days kept out of their own baseline, trajectory boost, persistence, per-metric noise floors | `symptomradar/engine.py` and its tests |
 | Honest non-scores: "No data", "Calibrating" and "Insufficient data" instead of a silent Normal | daily report and MCP JSON |
 | Re-fetches merge into stored days instead of blanking them; every real change is audited | `metric_revisions` table |
-| One definition of "today" (`SYMPTOM_RADAR_TZ`, default: the host's timezone) | engine and its tests |
+| One definition of "today" (`SYMPTOM_RADAR_TZ`, default: the host's timezone) | `symptomradar/config.py` and its tests |
 | Evaluation against independent labels on a frozen, read-only input | `evaluate.py` (numbers below) |
 | Separation classifier without lookahead, validated by leave-one-episode-out | `train.py` |
 | Extra-signal ablation, defaults unchanged | `ablate.py` (BENCHMARK.md section 7) |
 | Confounder logging (alcohol, exercise, travel, sleep loss) | `--confounders`, MCP tools, `evaluate.py` |
 | Labelling | `--label` CLI, MCP tools, `labels.py`; manual only, the nightly check-in was retired in 2026-08 |
 | Sensitivity analysis | `scenario.py`; now reports that no hypothesis can be validated on current labels |
+| Package, console command, offline commands without a token | `symptomradar/` package, `pyproject.toml` (`symptom-radar` command); the root `symptom_radar.py` is a thin entry script |
+| Tests and CI | 172 tests, no network and no token; GitHub Actions on Python 3.10 to 3.14 |
+| MCP server error handling | standard JSON-RPC codes for bad input, server keeps serving; `test_mcp.py` |
 
 ## The measured verdict (details in BENCHMARK.md)
 
