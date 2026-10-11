@@ -5,8 +5,7 @@ import sys
 from datetime import date, timedelta
 from pathlib import Path
 
-os.environ.setdefault("ULTRAHUMAN_TOKEN", "dummy")
-import symptom_radar as sr
+from symptomradar import engine, storage
 import train as tr
 import labels
 
@@ -78,15 +77,15 @@ def cli(db, *args):
 
 def setup_db(tmp_path, monkeypatch):
     db = tmp_path / 'labels.db'
-    monkeypatch.setattr(sr, 'DB_PATH', str(db))
-    sr.init_db().close()
+    monkeypatch.setattr(storage, 'DB_PATH', str(db))
+    storage.init_db().close()
     return db
 
 
 def test_cli_lists_real_labels_not_seeds(tmp_path, monkeypatch):
     db = setup_db(tmp_path, monkeypatch)
-    sr.log_label('2020-02-02', 'sick', 'actual second note')
-    sr.log_label('2020-02-01', 'rough', 'actual first note')
+    storage.log_label('2020-02-02', 'sick', 'actual second note')
+    storage.log_label('2020-02-01', 'rough', 'actual first note')
     r = cli(db)
     assert r.returncode == 0
     assert 'actual first note' in r.stdout and 'actual second note' in r.stdout
@@ -98,7 +97,7 @@ def test_seed_removed_without_writing_labels(tmp_path, monkeypatch):
     db = setup_db(tmp_path, monkeypatch)
     r = cli(db, '--seed')
     assert r.returncode == 2
-    assert sr.get_labels() == []
+    assert storage.get_labels() == []
     assert 'unrecognized arguments: --seed' in r.stderr
 
 
@@ -106,16 +105,16 @@ def test_memory_rejects_invalid_date_and_month_without_partial_write(tmp_path, m
     setup_db(tmp_path, monkeypatch)
     assert labels.bulk_from_memory('2020-02-01 sick, 2020-02-31 rough') == []
     assert labels.bulk_from_memory('xyz 22 sick') == []
-    assert sr.get_labels() == []
+    assert storage.get_labels() == []
 
 
 def test_episode_gate_rejects_many_days_in_one_episode(tmp_path, monkeypatch, capsys):
     setup_db(tmp_path, monkeypatch)
     h = history(120)
     for i in range(30, 45):
-        sr.log_label(h[i]['date'], 'sick', 'synthetic sick fixture')
+        storage.log_label(h[i]['date'], 'sick', 'synthetic sick fixture')
     for i in range(60, 75):
-        sr.log_label(h[i]['date'], 'rough', 'synthetic rough fixture')
+        storage.log_label(h[i]['date'], 'rough', 'synthetic rough fixture')
     ready, counts = tr.status_report(h)
     assert ready is False
     assert counts == {'sick': 15, 'rough': 15, 'fine': 0}
@@ -129,9 +128,9 @@ def test_episode_gate_accepts_five_episodes_per_class(tmp_path, monkeypatch, cap
     h = history(120)
     for start in range(20, 70, 10):
         for i in range(start, start + 3):
-            sr.log_label(h[i]['date'], 'sick', 'synthetic sick fixture')
+            storage.log_label(h[i]['date'], 'sick', 'synthetic sick fixture')
         for i in range(start + 5, start + 8):
-            sr.log_label(h[i]['date'], 'rough', 'synthetic rough fixture')
+            storage.log_label(h[i]['date'], 'rough', 'synthetic rough fixture')
     ready, counts = tr.status_report(h)
     assert ready is True
     assert counts == {'sick': 15, 'rough': 15, 'fine': 0}
@@ -145,7 +144,7 @@ def test_memory_valid_range_writes_actual_labels(tmp_path, monkeypatch):
     year = labels.datetime.now().year
     assert labels.bulk_from_memory('Jan 3-4 sick') == [
         (f'{year}-01-03', 'sick'), (f'{year}-01-04', 'sick')]
-    assert sr.get_labels() == [
+    assert storage.get_labels() == [
         (f'{year}-01-03', 'sick', 'remembered retrospectively'),
         (f'{year}-01-04', 'sick', 'remembered retrospectively')]
 
@@ -170,7 +169,7 @@ def test_review_excludes_actual_labels(tmp_path, monkeypatch, capsys):
                 row['night_rhr'] = 100
             keys = list(row)
             conn.execute(f"INSERT INTO daily_snapshots ({','.join(keys)}) VALUES ({','.join('?' for _ in keys)})", list(row.values()))
-    sr.log_label('2020-02-01', 'rough', 'real label')
+    storage.log_label('2020-02-01', 'rough', 'real label')
     labels.review_candidates()
     out = capsys.readouterr().out
     assert '2020-02-01' not in out
@@ -186,16 +185,16 @@ def test_training_uses_engine_noise_floor_and_exact_scores():
     assert abs(feats['rhr_z'] - 4.0) < 1e-9
     assert abs(feats['hrv_z'] - 5.0) < 1e-9
     assert abs(feats['temp_z'] - 1.0) < 1e-9
-    assert feats['strain_idx'] == sr.assess_strain_result(h)['strain_index']
+    assert feats['strain_idx'] == engine.assess_strain_result(h)['strain_index']
     assert feats['elevated_3d'] == 1
 
 
 def test_training_does_not_parse_display_detail(monkeypatch):
     h = history(31)
-    result = sr.assess_strain_result(h)
+    result = engine.assess_strain_result(h)
     result.update(strain_index=1.23456789, elevated_recent=2, detail='not a machine interface')
     result['metrics']['recovery'] = {'z': -2, 'z_slope': 1.5, 'contribution': 0.1}
-    monkeypatch.setattr(sr, 'assess_strain_result', lambda rows: result)
+    monkeypatch.setattr(engine, 'assess_strain_result', lambda rows: result)
     feats = tr.extract_features(h, 30)
     assert feats['strain_idx'] == 1.23456789
     assert feats['elevated_3d'] == 2

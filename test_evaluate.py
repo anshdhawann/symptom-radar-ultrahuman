@@ -7,7 +7,6 @@ import sqlite3
 import subprocess
 import sys
 
-os.environ.setdefault("ULTRAHUMAN_TOKEN", "dummy")
 import evaluate
 
 

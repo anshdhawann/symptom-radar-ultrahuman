@@ -24,7 +24,7 @@ Usage:
 import argparse
 import sqlite3
 
-import symptom_radar as sr
+from symptomradar import storage
 import train as tr
 
 # Candidate strong episodes whose true nature only the user knows
@@ -53,7 +53,7 @@ def run_hypothesis(history, override, include_extra=True, offline=False):
     elevated_3d, rec_decline, rhr_z, hrv_z, temp_z) — the comparison set.
     include_extra=True adds sleep_z. Next-day rec_rebound requires offline=True.
     """
-    labels = {d: lbl for d, lbl, _ in sr.get_labels()}
+    labels = {d: lbl for d, lbl, _ in storage.get_labels()}
     for date, lbl in override.items():
         labels[date] = lbl  # override, not write to DB
 
@@ -102,7 +102,7 @@ def main():
     args = ap.parse_args()
     if args.offline:
         print("WARNING: --offline uses next-day recovery; results are not deployable.")
-    conn = sqlite3.connect(sr.DB_PATH)
+    conn = sqlite3.connect(storage.DB_PATH)
     cur = conn.execute("SELECT * FROM daily_snapshots ORDER BY date ASC")
     cols = [d[0] for d in cur.description]
     history = [dict(zip(cols, r)) for r in cur.fetchall()]

@@ -1,0 +1,19 @@
+[build-system]
+requires = ["setuptools>=61"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "symptom-radar-ultrahuman"
+version = "1.0.0"
+description = "Calendar-aligned biometric strain detection for Ultrahuman Ring"
+requires-python = ">=3.10"
+dependencies = ["requests>=2.28"]
+
+[project.optional-dependencies]
+test = ["pytest"]
+
+[project.scripts]
+symptom-radar = "symptomradar.cli:main"
+
+[tool.setuptools.packages.find]
+include = ["symptomradar*"]

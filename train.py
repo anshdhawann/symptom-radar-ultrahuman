@@ -17,7 +17,7 @@ import random
 import sqlite3
 from datetime import date as calendar_date
 
-import symptom_radar as sr
+from symptomradar import engine, storage
 
 # Minimum labels per class before training is meaningful.
 MIN_SICK = 15
@@ -30,12 +30,12 @@ MIN_EPISODES = 5
 def extract_features(history, today_idx, offline=False):
     """Return morning features, with next-day rebound only when offline=True."""
     today = history[today_idx]
-    result = sr.assess_strain_result(history[:today_idx + 1])
+    result = engine.assess_strain_result(history[:today_idx + 1])
     if result["status"] != "ok":
         return None
 
     feats = {}
-    for key, _extract, _w, inverted, _lbl in sr.STRAIN_METRICS:
+    for key, _extract, _w, inverted, _lbl in engine.STRAIN_METRICS:
         z = result["metrics"][key]["z"]
         feats[key + "_z"] = 0.0 if z is None else -z if inverted else z
     feats["strain_idx"] = result["strain_index"]
@@ -179,7 +179,7 @@ def episode_accuracy(X, y, groups, l2=0.01):
 # ─── Main ─────────────────────────────────────────────────────────────────────
 def collect_labeled(history, offline=False):
     """Build raw (features, y, meta) for assessable labeled days."""
-    labels = {d: lbl for d, lbl, _ in sr.get_labels()}
+    labels = {d: lbl for d, lbl, _ in storage.get_labels()}
     by_date = {h["date"]: i for i, h in enumerate(history)}
     X, y, meta = [], [], []
     for date, lbl in sorted(labels.items()):
@@ -199,7 +199,7 @@ def collect_labeled(history, offline=False):
 
 
 def status_report(history):
-    labels = sr.get_labels()
+    labels = storage.get_labels()
     counts = {"sick": 0, "rough": 0, "fine": 0}
     for _, lbl, _ in labels:
         counts[lbl] = counts.get(lbl, 0) + 1
@@ -243,7 +243,7 @@ def main():
     print("Features: " + ", ".join(OFFLINE_FEATURE_ORDER if args.offline else FEATURE_ORDER))
 
     history = []
-    conn = sqlite3.connect(sr.DB_PATH)
+    conn = sqlite3.connect(storage.DB_PATH)
     cur = conn.execute("SELECT * FROM daily_snapshots ORDER BY date ASC")
     cols = [d[0] for d in cur.description]
     history = [dict(zip(cols, r)) for r in cur.fetchall()]
@@ -266,7 +266,7 @@ def main():
               "Keep collecting manual labels.")
         return
 
-    episodes = label_episodes(sr.get_labels())
+    episodes = label_episodes(storage.get_labels())
     groups = [episodes[d] for d, _, _ in meta]
     ec = episode_counts(y, groups)
     acc, preds = episode_accuracy(X, y, groups)

@@ -63,8 +63,8 @@ def load_inputs(db_path, episodes_path=None, include_confounders=False):
 
 def score_all(history, scorer=None):
     if scorer is None:
-        import symptom_radar as sr
-        scorer = sr.assess_strain_result
+        from symptomradar import engine
+        scorer = engine.assess_strain_result
     return [{"date": row["date"], **scorer(history[:i + 1])}
             for i, row in enumerate(history)]
 

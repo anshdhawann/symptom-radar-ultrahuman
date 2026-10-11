@@ -8,15 +8,14 @@ import sys
 
 import pytest
 
-os.environ.setdefault("ULTRAHUMAN_TOKEN", "dummy")
-import symptom_radar as sr
+from symptomradar import config, engine, mcp, storage
 import evaluate
 
 
 @pytest.fixture
 def db(tmp_path, monkeypatch):
     path = tmp_path / "input.db"
-    monkeypatch.setattr(sr, "DB_PATH", str(path))
+    monkeypatch.setattr(storage, "DB_PATH", str(path))
     return path
 
 
@@ -42,11 +41,11 @@ def test_base_schema_migration_and_independent_records(db):
         conn.execute("INSERT INTO daily_labels VALUES ('2024-01-01','fine','original','timestamp')")
         original_schema = conn.execute("SELECT sql FROM sqlite_master WHERE name='daily_labels'").fetchone()[0]
     for _ in range(2):
-        sr.init_db().close()
-    sr.log_label("2024-01-02", None, confounders="alcohol=3,exercise,travel,sleep_loss")
-    sr.log_label("2024-01-02", None, confounders={"alcohol": 0})
-    assert sr.get_labels() == [("2024-01-01", "fine", "original")]
-    assert sr.get_confounders() == {"2024-01-02": {"alcohol": 0, "exercise": True, "travel": True, "sleep_loss": True}}
+        storage.init_db().close()
+    storage.log_label("2024-01-02", None, confounders="alcohol=3,exercise,travel,sleep_loss")
+    storage.log_label("2024-01-02", None, confounders={"alcohol": 0})
+    assert storage.get_labels() == [("2024-01-01", "fine", "original")]
+    assert storage.get_confounders() == {"2024-01-02": {"alcohol": 0, "exercise": True, "travel": True, "sleep_loss": True}}
     with sqlite3.connect(db) as conn:
         assert conn.execute("SELECT created_at FROM daily_labels").fetchone() == ("timestamp",)
         assert conn.execute("SELECT date,night_rhr FROM daily_snapshots").fetchall() == [("2024-01-01", 60.0)]
@@ -56,7 +55,7 @@ def test_base_schema_migration_and_independent_records(db):
 @pytest.mark.parametrize("value", ["unknown", "alcohol=-1", "alcohol=1.5", "alcohol=x", "alcohol", "exercise=maybe", {"alcohol": True}, {"alcohol": 1.0}, {"travel": 1}, {"unknown": True}])
 def test_invalid_confounders_rejected_before_label_write(db, value):
     with pytest.raises(ValueError, match="confounder|alcohol|exercise|travel"):
-        sr.log_label("2024-01-01", "fine", confounders=value)
+        storage.log_label("2024-01-01", "fine", confounders=value)
     assert not db.exists()
 
 
@@ -75,13 +74,13 @@ def test_cli_combined_and_confounder_only_and_listing(db):
 
 
 def test_mcp_old_and_new_fields(db):
-    old, error = sr._mcp_handle("tools/call", {"name": "symptom_radar_label", "arguments": {"date": "2024-01-01", "label": "fine"}})
+    old, error = mcp._mcp_handle("tools/call", {"name": "symptom_radar_label", "arguments": {"date": "2024-01-01", "label": "fine"}})
     assert error is None and json.loads(old["content"][0]["text"])["label"] == "fine"
-    result, error = sr._mcp_handle("tools/call", {"name": "symptom_radar_label", "arguments": {"date": "2024-01-02", "alcohol": 2, "exercise": True, "travel": False, "sleep_loss": True}})
+    result, error = mcp._mcp_handle("tools/call", {"name": "symptom_radar_label", "arguments": {"date": "2024-01-02", "alcohol": 2, "exercise": True, "travel": False, "sleep_loss": True}})
     assert error is None and json.loads(result["content"][0]["text"])["confounders"]["alcohol"] == 2
-    result, error = sr._mcp_handle("tools/call", {"name": "symptom_radar_label", "arguments": {"confounders": "bad"}})
+    result, error = mcp._mcp_handle("tools/call", {"name": "symptom_radar_label", "arguments": {"confounders": "bad"}})
     assert result is None and "confounder" in error
-    result, error = sr._mcp_handle("tools/call", {"name": "symptom_radar_label", "arguments": {"label": "fine", "alcohol": -2}})
+    result, error = mcp._mcp_handle("tools/call", {"name": "symptom_radar_label", "arguments": {"label": "fine", "alcohol": -2}})
     assert result is None and "alcohol" in error
 
 
@@ -96,20 +95,20 @@ def test_extra_metric_low_direction_missing_and_default_unchanged(key):
     import ablate
     rows = history()
     rows[-1][key] -= 20
-    default = sr.assess_strain_result(rows)
+    default = engine.assess_strain_result(rows)
     assert default["strain_index"] == 0.0 and default["level"] == 0
-    added = sr.assess_strain_result(rows, metrics=sr.STRAIN_METRICS + [ablate.CANDIDATES[key]])
+    added = engine.assess_strain_result(rows, metrics=engine.STRAIN_METRICS + [ablate.CANDIDATES[key]])
     assert added["metrics"][key]["contribution"] == 2.0
     assert added["level"] == 1
     rows[-1][key] = None
-    assert sr.assess_strain_result(rows, metrics=sr.STRAIN_METRICS + [ablate.CANDIDATES[key]])["strain_index"] == 0.0
+    assert engine.assess_strain_result(rows, metrics=engine.STRAIN_METRICS + [ablate.CANDIDATES[key]])["strain_index"] == 0.0
     rows[-1][key] = 100
-    assert sr.assess_strain_result(rows, metrics=sr.STRAIN_METRICS + [ablate.CANDIDATES[key]])["strain_index"] == 0.0
+    assert engine.assess_strain_result(rows, metrics=engine.STRAIN_METRICS + [ablate.CANDIDATES[key]])["strain_index"] == 0.0
 
 
 def test_ablation_coverage_fingerprint_and_unassessable(db):
     import ablate
-    conn = sr.init_db()
+    conn = storage.init_db()
     for row in history():
         conn.execute("INSERT INTO daily_snapshots (date,night_rhr,avg_sleep_hrv,temp_deviation,sleep_score) VALUES (?,?,?,?,?)", (row["date"],60,50,0,80))
     conn.commit()
@@ -126,13 +125,13 @@ def test_ablation_coverage_fingerprint_and_unassessable(db):
 
 
 def test_confounder_rates_exclude_unrecorded_and_unassessable(db):
-    conn = sr.init_db()
+    conn = storage.init_db()
     conn.executemany("INSERT INTO daily_snapshots (date,night_rhr) VALUES (?,?)", [("2024-01-01",1), ("2024-01-02",0), ("2024-01-03",1), ("2024-01-04",None)])
     conn.commit()
     conn.close()
-    sr.log_label("2024-01-01", None, confounders="alcohol=3,exercise")
-    sr.log_label("2024-01-02", None, confounders="alcohol=0,exercise=false")
-    sr.log_label("2024-01-04", None, confounders="alcohol=3")
+    storage.log_label("2024-01-01", None, confounders="alcohol=3,exercise")
+    storage.log_label("2024-01-02", None, confounders="alcohol=0,exercise=false")
+    storage.log_label("2024-01-04", None, confounders="alcohol=3")
     def scorer(rows):
         val = rows[-1]["night_rhr"]
         return {"status": "ok" if val is not None else "no_data", "level": val, "strain_index": val}
@@ -146,16 +145,16 @@ def test_confounder_rates_exclude_unrecorded_and_unassessable(db):
 
 
 def test_exposures_preserve_label_and_partial_updates(db):
-    sr.log_label("2024-01-01", "sick", "fever", confounders="travel")
-    sr.log_label("2024-01-01", None, confounders="alcohol=0,exercise=false,sleep_loss=false")
-    sr.log_label("2024-01-01", None, confounders="alcohol=0,exercise=false,sleep_loss=false")
-    assert sr.get_labels() == [("2024-01-01", "sick", "fever")]
-    assert sr.get_confounders() == {"2024-01-01": {"alcohol": 0, "exercise": False, "travel": True, "sleep_loss": False}}
+    storage.log_label("2024-01-01", "sick", "fever", confounders="travel")
+    storage.log_label("2024-01-01", None, confounders="alcohol=0,exercise=false,sleep_loss=false")
+    storage.log_label("2024-01-01", None, confounders="alcohol=0,exercise=false,sleep_loss=false")
+    assert storage.get_labels() == [("2024-01-01", "sick", "fever")]
+    assert storage.get_confounders() == {"2024-01-01": {"alcohol": 0, "exercise": False, "travel": True, "sleep_loss": False}}
 
 
 @pytest.mark.parametrize("arguments", [{"confounders": "exercise,exercise"}, {"confounders": "alcohol=2", "alcohol": 3}, {"unknown": True}, {}])
 def test_mcp_boundary_rejects_duplicates_unknown_and_empty(db, arguments):
-    result, error = sr._mcp_handle("tools/call", {"name": "symptom_radar_label", "arguments": arguments})
+    result, error = mcp._mcp_handle("tools/call", {"name": "symptom_radar_label", "arguments": arguments})
     assert result is None
     assert error in ("Duplicate confounder: exercise", "Duplicate confounder fields", "Unknown label or confounder fields: ['unknown']", "Provide a label or confounders")
     assert not db.exists()
@@ -166,24 +165,24 @@ def test_extra_metrics_do_not_replace_core_coverage_or_baseline():
     rows = history()
     for row in rows:
         row["night_rhr"] = row["avg_sleep_hrv"] = row["temp_deviation"] = None
-    result = sr.assess_strain_result(rows, metrics=[*sr.STRAIN_METRICS, ablate.CANDIDATES["sleep_score"]])
+    result = engine.assess_strain_result(rows, metrics=[*engine.STRAIN_METRICS, ablate.CANDIDATES["sleep_score"]])
     assert result["status"] == "no_data" and result["level"] is None
     rows = history()
     for row in rows[:-1]:
         row["sleep_score"] = None
     rows[-1]["sleep_score"] = 10
-    result = sr.assess_strain_result(rows, metrics=[*sr.STRAIN_METRICS, ablate.CANDIDATES["sleep_score"]])
+    result = engine.assess_strain_result(rows, metrics=[*engine.STRAIN_METRICS, ablate.CANDIDATES["sleep_score"]])
     assert result["level"] == 0 and result["metrics"]["sleep_score"]["contribution"] is None
 
 
 def test_ablation_and_evaluation_cli_are_read_only(db):
     import hashlib
-    conn = sr.init_db()
+    conn = storage.init_db()
     for row in history():
         conn.execute("INSERT INTO daily_snapshots (date,night_rhr,avg_sleep_hrv,temp_deviation,sleep_score) VALUES (?,?,?,?,?)", (row["date"],60,50,0,80))
     conn.commit()
     conn.close()
-    sr.log_label("2024-01-30", "fine", confounders="exercise")
+    storage.log_label("2024-01-30", "fine", confounders="exercise")
     before = hashlib.sha256(db.read_bytes()).hexdigest()
     result = cli(db, "--db", str(db), script="ablate.py")
     assert result.returncode == 0, result.stderr
@@ -204,8 +203,8 @@ def test_ablation_and_evaluation_cli_are_read_only(db):
 def test_no_argument_report_markers_with_mocked_fetch(db, monkeypatch, capsys, rhr, expected):
     import runpy
     from unittest.mock import patch
-    today = sr.wearer_now().date()
-    conn = sr.init_db()
+    today = config.wearer_now().date()
+    conn = storage.init_db()
     for i in range(30):
         day = str(today - dt.timedelta(days=29-i))
         conn.execute("INSERT INTO daily_snapshots (date,night_rhr,avg_sleep_hrv,temp_deviation) VALUES (?,?,50,0)", (day, rhr if i >= 27 else 60))
@@ -221,8 +220,9 @@ def test_no_argument_report_markers_with_mocked_fetch(db, monkeypatch, capsys, r
             ]}}}
     monkeypatch.setenv("SYMPTOM_RADAR_DB", str(db))
     monkeypatch.setattr(sys, "argv", ["symptom_radar.py"])
+    monkeypatch.setenv("ULTRAHUMAN_TOKEN", "dummy")
     with patch("requests.get", return_value=Response()):
-        runpy.run_path(sr.__file__, run_name="__main__")
+        runpy.run_path(str(__import__("pathlib").Path(__file__).with_name("symptom_radar.py")), run_name="__main__")
     output = capsys.readouterr().out
     assert expected in output
     print(next(line for line in output.splitlines() if expected in line))
@@ -247,4 +247,4 @@ def test_stdio_mcp_confounder_logging_and_schema(db):
     assert {"required": ["label"]} in tools["symptom_radar_label"]["inputSchema"]["anyOf"]
     assert json.loads(responses[1]["result"]["content"][0]["text"])["confounders"] == {"alcohol": 2, "travel": True}
     assert responses[2]["error"]["message"] == "alcohol must be a non-negative integer drink count"
-    assert sr.get_confounders() == {"2024-01-01": {"alcohol": 2, "exercise": None, "travel": True, "sleep_loss": None}}
+    assert storage.get_confounders() == {"2024-01-01": {"alcohol": 2, "exercise": None, "travel": True, "sleep_loss": None}}
