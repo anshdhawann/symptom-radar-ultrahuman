@@ -1,6 +1,12 @@
 from . import config, engine, report, storage
 import json, sys
 
+class RpcError(Exception):
+    def __init__(self, code, message):
+        super().__init__(message)
+        self.code = code
+
+
 def _mcp_handle(method, params):
     """Dispatch one MCP method call. Returns (result_dict, error_str_or_None)."""
     if method == "initialize":
@@ -67,12 +73,23 @@ def _mcp_handle(method, params):
         ]}, None
 
     if method == "tools/call":
-        name = (params or {}).get("name")
-        args = (params or {}).get("arguments", {}) or {}
+        if not isinstance(params, dict):
+            raise RpcError(-32602, "params must be an object")
+        name = params.get("name")
+        if not isinstance(name, str):
+            raise RpcError(-32602, "tool name must be a string")
+        args = params.get("arguments", {})
+        if not isinstance(args, dict):
+            raise RpcError(-32602, "arguments must be an object")
         if name == "symptom_radar_report":
             return {"content": [{"type": "text", "text": report.build_report()}]}, None
         if name == "symptom_radar_history":
-            days = int(args.get("days", 14))
+            days = args.get("days", 14)
+            if type(days) is not int or not 1 <= days <= 90:
+                raise RpcError(-32602, "days must be an integer between 1 and 90")
+            if "metrics" in args and (not isinstance(args["metrics"], list)
+                    or not all(isinstance(item, str) for item in args["metrics"])):
+                raise RpcError(-32602, "metrics must be an array of strings")
             metrics = args.get("metrics") or [
                 "date", "sleep_score", "night_rhr", "sleep_rhr",
                 "avg_sleep_hrv", "temp_deviation",
@@ -131,56 +148,60 @@ def _mcp_handle(method, params):
         if name == "symptom_radar_labels":
             return {"content": [{"type": "text",
                                  "text": json.dumps(storage.get_labels(), indent=2)}]}, None
-        return None, f"Unknown tool: {name}"
+        raise RpcError(-32601, f"Unknown tool: {name}")
 
-    return None, f"Unknown method: {method}"
+    raise RpcError(-32601, f"Unknown method: {method}")
+
+def _respond(req_id, *, result=None, error=None):
+    response = {"jsonrpc": "2.0", "id": req_id}
+    if error is not None:
+        response["error"] = {"code": error.code, "message": str(error)}
+    else:
+        response["result"] = result
+    sys.stdout.write(json.dumps(response) + "\n")
+    sys.stdout.flush()
+
 
 def run_mcp_server():
-    """Read JSON-RPC requests from stdin, write responses to stdout.
-
-    Honors the initialized notification and the standard initialize handshake.
-    Responds to ping. Closes on EOF or shutdown request.
-    """
+    """Serve line-delimited JSON-RPC until EOF or shutdown, isolating each request."""
     for line in sys.stdin:
-        line = line.strip()
-        if not line:
+        if not line.strip():
             continue
+        req_id = None
         try:
             req = json.loads(line)
-        except json.JSONDecodeError:
-            sys.stdout.write(json.dumps({
-                "jsonrpc": "2.0", "id": None,
-                "error": {"code": -32700, "message": "Parse error"},
-            }) + "\n")
-            sys.stdout.flush()
+        except (ValueError, RecursionError):
+            _respond(None, error=RpcError(-32700, "Parse error"))
             continue
-
+        if not isinstance(req, dict):
+            _respond(None, error=RpcError(-32600, "Invalid request"))
+            continue
         req_id = req.get("id")
-        method = req.get("method")
-
-        if method == "shutdown":
-            if req_id is not None:
-                sys.stdout.write(json.dumps({"jsonrpc": "2.0", "id": req_id, "result": {}}) + "\n")
-                sys.stdout.flush()
-            break
-
-        # Notifications (no id) — initialize, notifications/initialized — just ack silently
-        if req_id is None:
+        valid_id = req_id is None or type(req_id) in (str, int, float)
+        if (req.get("jsonrpc") != "2.0" or not isinstance(req.get("method"), str)
+                or not valid_id):
+            _respond(req_id if valid_id else None, error=RpcError(-32600, "Invalid request"))
             continue
-
-        if method == "ping":
-            sys.stdout.write(json.dumps({"jsonrpc": "2.0", "id": req_id, "result": {}}) + "\n")
-            sys.stdout.flush()
+        method = req["method"]
+        if "id" not in req:
+            if method == "shutdown":
+                break
             continue
-
-        result, err = _mcp_handle(method, req.get("params"))
-        if err is not None:
-            sys.stdout.write(json.dumps({
-                "jsonrpc": "2.0", "id": req_id,
-                "error": {"code": -32601, "message": err},
-            }) + "\n")
+        try:
+            params = req.get("params", {})
+            if not isinstance(params, dict):
+                raise RpcError(-32602, "params must be an object")
+            if method in ("ping", "shutdown"):
+                result = {}
+            else:
+                result, error = _mcp_handle(method, params)
+                if error is not None:
+                    raise RpcError(-32602, error)
+            _respond(req_id, result=result)
+        except RpcError as exc:
+            _respond(req_id, error=exc)
+        except Exception:
+            _respond(req_id, error=RpcError(-32603, "Internal error"))
         else:
-            sys.stdout.write(json.dumps({
-                "jsonrpc": "2.0", "id": req_id, "result": result,
-            }) + "\n")
-        sys.stdout.flush()
+            if method == "shutdown":
+                break
