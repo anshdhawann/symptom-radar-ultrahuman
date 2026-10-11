@@ -1,43 +1,29 @@
 #!/usr/bin/env python3
-"""
-Train and verify the sickness-vs-alcohol separation classifier.
+"""Train a live-feature sick-vs-rough classifier from real self-report labels.
 
-Once enough self-report labels exist (target: ~15 sick and ~15 rough days),
-this trains a small logistic classifier on the engine's features and
-verifies whether it can separate REAL ILLNESS (sick) from ALCOHOL STRAIN
-(rough) — the distinction the biometrics alone cannot make.
-
-Features per labeled day (all computed from data BEFORE that day, no lookahead):
-  strain_idx  — engine strain index (weighted deviation from clean baseline)
-  elevated_3d — how many of the last 3 days were elevated
-  rec_decline — 1 if the recovery-slope leading indicator fired (Recovery↓)
-  rhr_z       — RHR level z vs baseline (strain direction)
-  hrv_z       — HRV level z vs baseline (strain direction)
-  temp_z      — Temp level z vs baseline (strain direction)
-
-Method:
-  - Pure-stdlib logistic regression (batch gradient descent, L2) — no numpy,
-    no sklearn, consistent with the project's requests-only philosophy.
-  - Features are z-normalized per column before training.
-  - Verification: leave-one-out cross-validation (honest for small n), plus
-    per-class strain statistics.
+Training requires 15 assessable days and five independent episodes per class.
+Validation holds out whole same-label episodes, allowing one unlabeled gap
+day, and fits column normalization on each training fold only.
 
 Usage:
-    python3 train.py              # train if enough labels, else show what's needed
-    python3 train.py --force      # train anyway (e.g. to see where it stands)
-    python3 train.py --status     # just show collection progress
+    python3 train.py              # show progress unless collection gate is met
+    python3 train.py --force      # diagnostic analysis below the collection gate
+    python3 train.py --status     # collection progress only
+    python3 train.py --offline    # next-day rebound, not deployable
 """
 import argparse
 import math
 import random
 import sqlite3
-import sys
+from datetime import date as calendar_date
 
 import symptom_radar as sr
 
 # Minimum labels per class before training is meaningful.
 MIN_SICK = 15
 MIN_ROUGH = 15
+# Five episodes per class leave four independent examples in every held-out fold.
+MIN_EPISODES = 5
 
 
 # ─── Feature extraction ───────────────────────────────────────────────────────
@@ -45,15 +31,15 @@ def _baseline_stats_series(pool, extract):
     base = [extract(d) for d in pool]
     return sr._baseline_stats(base)
 
-def extract_features(history, today_idx):
-    """Return the feature vector for the day at today_idx (no lookahead)."""
+def extract_features(history, today_idx, offline=False):
+    """Return morning features, with next-day rebound only when offline=True."""
     today = history[today_idx]
-    baseline_pool = history[max(0, today_idx - sr.CLEAN_GUARD - sr.BASELINE_WINDOW)
-                            :today_idx - sr.CLEAN_GUARD] or []
+    baseline_end = today_idx - sr.CLEAN_GUARD
+    if baseline_end <= 0:
+        return None
+    baseline_pool = history[max(0, baseline_end - sr.BASELINE_WINDOW):baseline_end]
     if len(baseline_pool) < 7:
         return None
-
-    recent = history[max(0, today_idx - sr.TRAJ_WINDOW + 1):today_idx + 1]
 
     feats = {}
     for key, extract, _w, inverted, _lbl in sr.STRAIN_METRICS:
@@ -79,6 +65,9 @@ def extract_features(history, today_idx):
     # when missing so the classifier still trains.
     feats["sleep_z"] = today.get("sleep_score") or 0.0
 
+    if not offline:
+        return feats
+
     # Recovery-rebound shape: change in recovery 24h AFTER today (sick days
     # tend to stay depressed, rough days bounce back). Only computable
     # retroactively — used by scenario.py's diagnostic analysis, NOT for
@@ -95,12 +84,10 @@ def extract_features(history, today_idx):
     return feats
 
 
-# Feature order (must stay stable across calls).
-# NOTE: rec_rebound uses NEXT-day recovery (today_idx + 1) — it is offline-only.
-# This trainer is a retrospective diagnostic; a real-time morning alert must
-# drop rec_rebound (scenario.py showed core-only features score about the same).
+# Morning features include the scored night, but never the following day.
 FEATURE_ORDER = ["strain_idx", "elevated_3d", "rec_decline",
-                 "rhr_z", "hrv_z", "temp_z", "sleep_z", "rec_rebound"]
+                 "rhr_z", "hrv_z", "temp_z", "sleep_z"]
+OFFLINE_FEATURE_ORDER = FEATURE_ORDER + ["rec_rebound"]
 
 
 # ─── Pure-stdlib logistic regression ──────────────────────────────────────────
@@ -147,39 +134,82 @@ def zscore_cols(X):
     Xn = [[(x[j] - means[j]) / stds[j] for j in range(d)] for x in X]
     return Xn, (means, stds)
 
-def loo_accuracy(X, y, l2=0.01):
-    """Leave-one-out cross-validation accuracy."""
-    n = len(X)
-    correct = 0
-    preds = []
-    for i in range(n):
-        Xtr = [x for j, x in enumerate(X) if j != i]
-        ytr = [v for j, v in enumerate(y) if j != i]
+def normalize_fold(X, train_indices, test_indices):
+    """Fit on training rows and apply those statistics to held-out rows."""
+    Xtr, stats = zscore_cols([X[i] for i in train_indices])
+    means, stds = stats
+    Xte = [[(X[i][j] - means[j]) / stds[j] for j in range(len(means))]
+           for i in test_indices]
+    return Xtr, Xte, stats
+
+
+def label_episodes(labels):
+    """Map dates to same-label episode starts, allowing one unlabeled gap day."""
+    groups = {}
+    previous_date = previous_label = start = None
+    for day, label, _ in sorted(labels):
+        current = calendar_date.fromisoformat(day)
+        if (previous_date is None or label != previous_label
+                or (current - previous_date).days > 2):
+            start = day
+        groups[day] = start
+        previous_date, previous_label = current, label
+    return groups
+
+
+def episode_counts(y, groups):
+    return {label: len({g for value, g in zip(y, groups) if value == target})
+            for label, target in (("sick", 1), ("rough", 0))}
+
+
+def loo_accuracy(X, y, l2=0.01, groups=None):
+    """Cross-validation on raw features with fold-local normalization.
+
+    Without groups this is day LOO, retained for numerical unit tests only.
+    User-facing analyses always supply episode IDs.
+    """
+    groups = list(range(len(X))) if groups is None else groups
+    preds = [(0, value) for value in y]
+    for group in dict.fromkeys(groups):
+        train_indices = [i for i, g in enumerate(groups) if g != group]
+        test_indices = [i for i, g in enumerate(groups) if g == group]
+        if not train_indices:
+            return None, []
+        Xtr, Xte, _ = normalize_fold(X, train_indices, test_indices)
+        ytr = [y[i] for i in train_indices]
         w, b = train_logistic(Xtr, ytr, l2=l2)
-        p = logistic_predict(w, b, X[i])
-        pred = 1 if p >= 0.5 else 0
-        preds.append((pred, y[i]))
-        if pred == y[i]:
-            correct += 1
-    return correct / n, preds
+        for i, x in zip(test_indices, Xte):
+            pred = int(logistic_predict(w, b, x) >= 0.5)
+            preds[i] = (pred, y[i])
+    if not preds:
+        return None, []
+    return sum(p == t for p, t in preds) / len(preds), preds
+
+
+def episode_accuracy(X, y, groups, l2=0.01):
+    """Leave one whole episode out, requiring both classes in every fold."""
+    if min(episode_counts(y, groups).values()) < 2:
+        return None, []
+    return loo_accuracy(X, y, l2=l2, groups=groups)
 
 
 # ─── Main ─────────────────────────────────────────────────────────────────────
-def collect_labeled(history):
-    """Build (features, y, meta) for every labeled day, no lookahead."""
+def collect_labeled(history, offline=False):
+    """Build raw (features, y, meta) for assessable labeled days."""
     labels = {d: lbl for d, lbl, _ in sr.get_labels()}
     by_date = {h["date"]: i for i, h in enumerate(history)}
     X, y, meta = [], [], []
-    for date, lbl in labels.items():
+    for date, lbl in sorted(labels.items()):
         if lbl not in ("sick", "rough"):
             continue
         idx = by_date.get(date)
         if idx is None:
             continue
-        feats = extract_features(history, idx)
+        feats = extract_features(history, idx, offline=offline)
         if feats is None:
             continue
-        X.append([feats[k] for k in FEATURE_ORDER])
+        order = OFFLINE_FEATURE_ORDER if offline else FEATURE_ORDER
+        X.append([feats[k] for k in order])
         y.append(1 if lbl == "sick" else 0)
         meta.append((date, lbl, feats))
     return X, y, meta
@@ -197,13 +227,22 @@ def status_report(history):
     print(f"  sick : {counts['sick']}  (need {MIN_SICK} → "
           f"{max(0, MIN_SICK - counts['sick'])} more)")
     print()
-    ready = counts["sick"] >= MIN_SICK and counts["rough"] >= MIN_ROUGH
-    if not ready:
-        print(f"Not ready to train: need {max(0, MIN_SICK - counts['sick'])} more "
-              f"sick + {max(0, MIN_ROUGH - counts['rough'])} more rough days.")
+    _, eligible_y, meta = collect_labeled(history)
+    episodes = label_episodes(labels)
+    ec = episode_counts(eligible_y, [episodes[d] for d, _, _ in meta])
+    print(f"Assessable labeled days: sick={eligible_y.count(1)}, rough={eligible_y.count(0)}")
+    print(f"Independent assessable episodes: sick={ec['sick']}, rough={ec['rough']}")
+    print(f"Need {MIN_EPISODES} episodes per class as well as 15 days per class.")
+    ready = (eligible_y.count(1) >= MIN_SICK and eligible_y.count(0) >= MIN_ROUGH
+             and min(ec.values()) >= MIN_EPISODES)
+    if ready:
+        print("Ready to train: collection gate met. Run python3 train.py.")
+    else:
+        print(f"Need {max(0, MIN_EPISODES - ec['sick'])} more sick episodes + "
+              f"{max(0, MIN_EPISODES - ec['rough'])} more rough episodes.")
+        print(f"Not ready to train: need {max(0, MIN_SICK - eligible_y.count(1))} more "
+              f"assessable sick + {max(0, MIN_ROUGH - eligible_y.count(0))} more assessable rough days.")
         print("The nightly cron (21:00) is collecting these automatically.")
-        print(f"Estimated: {max(MIN_SICK - counts['sick'], MIN_ROUGH - counts['rough'], 0)} "
-              f"more labeled days minimum.")
     return ready, counts
 
 
@@ -213,7 +252,12 @@ def main():
                     help="train even if below minimum label counts")
     ap.add_argument("--status", action="store_true",
                     help="show collection progress only")
+    ap.add_argument("--offline", action="store_true",
+                    help="include lookahead features for retrospective analysis only")
     args = ap.parse_args()
+    if args.offline:
+        print("WARNING: --offline uses next-day recovery; results are not deployable.")
+    print("Features: " + ", ".join(OFFLINE_FEATURE_ORDER if args.offline else FEATURE_ORDER))
 
     history = []
     conn = sqlite3.connect(sr.DB_PATH)
@@ -231,7 +275,7 @@ def main():
         print("\n[--force] Training anyway on the current (insufficient) labels — "
               "results are a diagnostic peek, not a validated classifier.")
 
-    X, y, meta = collect_labeled(history)
+    X, y, meta = collect_labeled(history, offline=args.offline)
     print(f"\nTraining on {len(X)} labeled days "
           f"({sum(1 for v in y if v == 1)} sick, {sum(1 for v in y if v == 0)} rough)")
     if len(X) < 4 or (not args.force and (counts["sick"] < MIN_SICK or counts["rough"] < MIN_ROUGH)):
@@ -239,10 +283,16 @@ def main():
               "Keep the nightly labels coming.")
         return
 
-    Xn, _ = zscore_cols(X)
-    acc, preds = loo_accuracy(Xn, y)
-
-    print(f"\n=== Leave-one-out verification ===")
+    episodes = label_episodes(sr.get_labels())
+    groups = [episodes[d] for d, _, _ in meta]
+    ec = episode_counts(y, groups)
+    acc, preds = episode_accuracy(X, y, groups)
+    print("\n=== Leave-one-episode-out verification ===")
+    if acc is None:
+        print(f"Cannot validate sick-vs-rough separation with {ec['sick']} independent sick episode(s) "
+              f"and {ec['rough']} independent rough episode(s).")
+        print("Every held-out fold needs both classes in training. Keep collecting independent episodes.")
+        return "unvalidated"
     print(f"Accuracy: {acc:.2f}  ({len(X)} labeled days)")
     tp = sum(1 for p, t in preds if p == 1 and t == 1)
     tn = sum(1 for p, t in preds if p == 0 and t == 0)
@@ -270,8 +320,8 @@ def main():
     print(f"Sick precision: {sick_precision:.2f}  "
           f"(of days called sick, how many were really sick)")
     print()
-    if n_sick < 5:
-        print(f"⚠️ Too few sick labels ({n_sick}) for a trustworthy verdict —")
+    if not ready or args.offline:
+        print("Insufficient independent episodes/days or offline features for a deployable verdict.")
         print("   this is a diagnostic peek, not a validated classifier.")
         verdict = "peek"
     elif sick_recall >= 0.7 and sick_precision >= 0.5 and acc >= 0.7:
@@ -285,8 +335,7 @@ def main():
     else:
         print("❌ Not separable yet — sick days are still being missed or"
               " confounded.")
-        print("   Keep collecting. The recovery-curve shape (hangovers rebound")
-        print("   in 1 day, illness persists 2-3) may need a dedicated feature.")
+        print("   Keep collecting independent episodes.")
         verdict = "not_separable"
     print()
     print("Per-day predictions (highest strain first):")
