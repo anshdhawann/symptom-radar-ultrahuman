@@ -1,7 +1,7 @@
-# Symptom Radar — Project Status
+# Symptom Radar: Project Status
 
 Handoff artifact. Everything below is measured or verified; nothing is claimed
-beyond the evidence.
+beyond the evidence. Last measured 2026-10-11 on a frozen 169-day snapshot.
 
 ## What this project is
 
@@ -13,88 +13,85 @@ privacy-preserving alternative to commercial symptom-radar products.
 
 | Item | Evidence |
 |---|---|
-| Strain engine (clean baseline, trajectory, persistence, noise scaling) | `symptom_radar.py` — 40/40 tests pass |
-| Accuracy fixes: one-sided HRV, median-gated mean-reversion, recovery-slope leading indicator | `symptom_radar.py` (shipped in the initial public commit) |
-| Retrospective evaluation on months of real data | `evaluate.py` (re-run 2026-10-05, 163 days): 27 flags, 8 true positives, 17 false positives (11% FPR), recall 8/11 |
-| Oura comparison (honest, vs published TemPredict numbers) | `BENCHMARK.md` |
-| Labeling infrastructure (fine/rough/sick) | `--label` CLI, MCP tools, `labels.py` |
-| Label collection | manual only (`--label` CLI / MCP tools) — the nightly check-in automation was retired |
-| Classification + verification | `train.py` (pure-stdlib logistic, leave-one-out, honest verdicts) |
-| Sensitivity analysis | `scenario.py` (hypotheses A/B/C for unconfirmed episodes) |
-| End-to-end pipeline proof | dry-run on scratch DB: from-memory → status → train → evaluate all work |
+| Strain engine: calendar-aligned clean baseline (the 21 days ending 3 days before today, median/MAD reference), illness-grade days kept out of their own baseline, trajectory boost, persistence, per-metric noise floors | engine and its tests |
+| Honest non-scores: "No data", "Calibrating" and "Insufficient data" instead of a silent Normal | daily report and MCP JSON |
+| Re-fetches merge into stored days instead of blanking them; every real change is audited | `metric_revisions` table |
+| One definition of "today" (`SYMPTOM_RADAR_TZ`, default: the host's timezone) | engine and its tests |
+| Evaluation against independent labels on a frozen, read-only input | `evaluate.py` (numbers below) |
+| Separation classifier without lookahead, validated by leave-one-episode-out | `train.py` |
+| Extra-signal ablation, defaults unchanged | `ablate.py` (BENCHMARK.md section 7) |
+| Confounder logging (alcohol, exercise, travel, sleep loss) | `--confounders`, MCP tools, `evaluate.py` |
+| Labelling | `--label` CLI, MCP tools, `labels.py`; manual only, the nightly check-in was retired in 2026-08 |
+| Sensitivity analysis | `scenario.py`; now reports that no hypothesis can be validated on current labels |
 
-## The measured verdict (BENCHMARK.md, in full)
+## The measured verdict (details in BENCHMARK.md)
 
-> **Data-revision note (2026-09):** Ultrahuman's backend revised historical
-> metrics retroactively. Re-fetching the full archive changed mid-summer
-> values enough that most multi-day deviation clusters the original episode
-> list was built from no longer exist in the data (one confirmed-sick day's
-> temperature deviation shrank from +0.52 to +0.33 °C, for example). The
-> episodes were re-derived from the refreshed data, and `evaluate.py` now
-> also counts self-reported rough/sick labels as ground truth. Numbers
-> before/after the refresh are not comparable.
+Frozen snapshot, 169 days, 135 assessable:
 
-1. **Strain detection: catches every labeled strain day.** On refreshed
-   data (2026-10-05): 8/11 episode days flagged; 4/5 self-reported rough days
-   above the fine-day threshold. The cost is a band of marginal level-1 flags
-   on unlabeled days (17, ~11% of healthy days) — most sit at index 1.0-1.4
-   with no multi-day persistence, i.e. single rough-sleep nights, not
-   illness-shaped signatures.
-2. **Pre-symptomatic lead time: cannot beat Oura.** That capability is
+1. **Strain: every labelled episode flagged.** 4 of 4 rough or sick episodes,
+   each on its first or second day; 5 of 8 labelled days. False positives on
+   days labelled fine: 1 of 16. Alerts on unlabelled days: 22 of 109 (20%).
+2. **Illness: one episode, flagged on its first day, not before.** Days 2
+   and 3 scored 0.00 and 0.01. No lead time demonstrated.
+3. **Pre-symptomatic lead time: cannot beat Oura.** That capability is
    RR-gated, and RR is not obtainable from the Ultrahuman Partner API
    (verified: no respiratory fields documented; legacy endpoint returns
    `respiratory_graph: null`).
-3. **Sickness vs non-illness strain: NOT yet separable.** `evaluate.py --labels`
-   shows sick/rough fully interleaved. `train.py --force` shows sick recall
-   0/2 — the classifier catches no real sick days with current labels.
+4. **Sickness vs non-illness strain: NOT yet separable.** `train.py --force`
+   prints "Cannot validate sick-vs-rough separation with 1 independent sick
+   episode(s) and 3 independent rough episode(s)."
+
+The earlier 73% recall / 89% specificity figures, and `scenario.py`'s 0.50 to
+0.67 recall, are withdrawn. BENCHMARK.md sections 3 and 6 explain why.
+
+> **Data-revision note (2026-09):** Ultrahuman's backend revised historical
+> metrics retroactively (one confirmed-sick day's temperature deviation
+> shrank from +0.52 to +0.33 °C, for example). Numbers measured before that
+> refresh are not comparable with the ones above.
 
 ## What is BLOCKED and why
 
-The sick-vs-strain separation requires **labeled days**. `train.py` gates at
-15 sick + 15 rough. **Labels must not be fabricated** — that would corrupt the
-evaluation worse than missing data.
+The sick-vs-strain separation needs **labelled episodes**. `train.py` gates at
+15 labelled days **and** 5 independent episodes per class. Current: sick 3
+days in 1 episode, rough 5 days in 3 episodes. **Labels must not be
+fabricated**; that would corrupt the evaluation worse than missing data.
 
 The retrospective route is **closed**: the wearer no longer remembers the
-strongest unconfirmed episodes, and the nightly check-in no longer asks about
-them. `scenario.py` documented the stakes at the time: if those episodes were
-**sick** (hypothesis A), the classifier reached 0.50-0.67 recall / 0.50-0.60
-precision; if **rough**, it stayed at 0 until real illness added sick labels.
-Those hypotheses are no longer testable — collection is forward-only.
+strongest unconfirmed episodes, so collection is forward-only.
 
 ## The path forward (forward-only collection)
 
-Realistic pace from the wearer's history (3 sick days in ~3 months, most in
-one episode): reaching 15 sick labels by manual logging alone is likely a
-**12+ month** wait. Rough labels arrive faster (~1.7/month → 10 more ≈ 6
-months). The honest verdict: measured sick-vs-alcohol separation will not
-exist until real sick episodes accumulate AND are labeled as they happen.
+- **Sick:** 4 more independent episodes and 12 more days needed. One episode
+  occurred in 5.5 months of data; at that pace this is roughly 2 years away
+  (ESTIMATED from a single episode).
+- **Rough:** 2 more independent episodes and 10 more days needed.
+- Log confounders with each label so `evaluate.py` can show which flags they
+  explain.
 
-Until then, the engine still ships the practical value: every labeled
-strain day is flagged, plus `morning_alertness` (sleep-inertia minutes,
-captured since 2026-09) is stored for the label-correlation work ahead,
-and BENCHMARK.md's honest Oura comparison stands.
+Until then, the engine still ships the practical value: every labelled
+strain episode is flagged, and BENCHMARK.md's honest Oura comparison stands.
 
 ## If the wearer ever remembers a past episode
 
 ```bash
-# One sentence, natural language — any remembered episode:
+# One sentence, natural language, any remembered episode:
 python3 labels.py --from-memory "Jan 15 sick, Feb 18 sick, Mar 26-27 rough"
-# (or per-day: python3 symptom_radar.py --label sick --label-date YYYY-MM-DD)
-# 'don't remember' is also a valid, honest answer.
+# (or per day: python3 symptom_radar.py --label sick --label-date YYYY-MM-DD)
+# "don't remember" is also a valid, honest answer.
 
-# Then — ONE command runs the whole measurement chain
-# (status → scenario → train --force → evaluate --labels):
+# Then ONE command runs the whole measurement chain
+# (status, scenario, train --force, evaluate --labels):
 python3 labels.py --verify
 ```
 
-If the gate (15 sick + 15 rough) is met, drop `--force` (or edit run_verify)
-and `train.py` gives the validated verdict.
+Once the gate (15 days and 5 independent episodes per class) is met, run
+`python3 train.py` without `--force` for the validated verdict.
 
 ## Collection (manual, forward-only)
 
-- The nightly check-in automation was retired (2026-08) — collection is
-  manual: `python3 symptom_radar.py --label fine|rough|sick` or the MCP
-  tools whenever the wearer chooses to log.
+- `python3 symptom_radar.py --label fine|rough|sick`, optionally with
+  `--confounders "alcohol=2,exercise=true"`, or the MCP tools, whenever the
+  wearer chooses to log.
 - Retrospective probing is retired (the wearer doesn't recall the old
-  episodes); collection is forward-only.
-- Progress checkable anytime: `python3 labels.py --status`.
+  episodes).
+- Progress is checkable anytime: `python3 labels.py --status`.

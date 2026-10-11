@@ -120,7 +120,7 @@ Fetches ~35 days of historical data from the Ultrahuman API to build your baseli
 ```bash
 # Log how you actually felt (fine | rough | sick); defaults to today
 python3 symptom_radar.py --label rough --label-note "late night, 3 drinks"
-python3 symptom_radar.py --label sick --label-date 2026-07-10
+python3 symptom_radar.py --label sick --label-date 2026-03-14
 python3 symptom_radar.py --labels          # list logged labels
 
 python3 labels.py --status                 # progress toward the training gate
