@@ -643,7 +643,7 @@ def test_structured_scores_include_zero_and_recovery_slope():
     assert result["metrics"]["hrv"]["z_slope"] == 0.0
     assert result["metrics"]["temp"]["contribution"] == 0.0
     assert result["metrics"]["hrv"]["contribution"] > 0
-    assert result["elevated_recent"] == 2
+    assert result["elevated_recent"] == 0
     assert result["baseline_days"] == 21
 
 
@@ -708,6 +708,7 @@ def test_calibrating_report_has_no_cron_marker(tmp_path, monkeypatch):
 def test_mcp_strain_returns_structured_json(tmp_path, monkeypatch):
     import json
     conn, date = _report_db(tmp_path, monkeypatch, _flat_history())
+    sr.store_snapshot(conn, date, _flat_history()[0])
     conn.close()
     response, error = sr._mcp_handle("tools/call", {"name": "symptom_radar_strain"})
     assert error is None
@@ -717,6 +718,27 @@ def test_mcp_strain_returns_structured_json(tmp_path, monkeypatch):
     assert result["strain_index"] < 1.0
     assert result["coverage"] == ["rhr", "hrv", "temp"]
     assert result["metrics"]["temp"]["contribution"] == 0.0
+
+
+def test_mcp_without_current_day_does_not_reuse_yesterday(tmp_path, monkeypatch):
+    import json
+    conn, date = _report_db(tmp_path, monkeypatch, _flat_history())
+    conn.close()
+    response, error = sr._mcp_handle("tools/call", {"name": "symptom_radar_strain"})
+    assert error is None
+    result = json.loads(response["content"][0]["text"])
+    assert result["status"] == "no_data"
+    assert result["level"] is None
+
+
+def test_invalid_fetched_core_metrics_report_no_data(tmp_path, monkeypatch):
+    conn, date = _report_db(tmp_path, monkeypatch, _flat_history())
+    conn.close()
+    _mock_metrics(monkeypatch, [
+        {"type": "night_rhr", "object": {"avg": "invalid"}},
+        {"type": "avg_sleep_hrv", "object": {"value": float("inf")}},
+    ])
+    assert "⚪ No data: ring not synced" in sr.build_report()
 
 
 # ─── Tiny fallback runner (if pytest isn't installed) ───────────────────────
