@@ -89,8 +89,8 @@ def bulk_from_memory(text):
     text_l = text.lower()
     if any(w in text_l for w in ("don't remember", "dont remember", "not sure",
                                  "no idea", "forget", "unknown")):
-        print("Understood — no retrospective labels added. The nightly cron "
-              "keeps collecting from today forward.")
+        print("No retrospective labels added. Collect labels manually: "
+              "python3 symptom_radar.py --label fine|rough|sick")
         return []
 
     # Normalize month names
@@ -99,7 +99,7 @@ def bulk_from_memory(text):
 
     def expand_dates(date_tokens):
         """Expand 'Mar 26-27' → ['<current-year>-03-26','<current-year>-03-27']."""
-        year = datetime.now().year
+        year = sr.wearer_now().year
         out = []
         for tok in date_tokens:
             m = re.match(r"(\d{4})-(\d{2})-(\d{2})$", tok)

@@ -143,7 +143,7 @@ def main():
     print("Next-day rebound is available only with --offline and is not deployable.")
     print()
     print("Current REAL labels (no hypothesis applied): see labels.py --status.")
-    print("The nightly cron keeps collecting; labels.py --status tracks progress.")
+    print("Collect labels manually: python3 symptom_radar.py --label fine|rough|sick")
 
 
 if __name__ == "__main__":
