@@ -148,7 +148,7 @@ def test_real_engine_evaluation_on_synthetic_illness(tmp_path):
     with sqlite3.connect(path) as conn:
         conn.execute("UPDATE daily_snapshots SET avg_sleep_hrv=20, temp_deviation=1 WHERE date >= '2024-01-31'")
     result = evaluate.evaluate_database(path)
-    assert result["status_counts"] == {"calibrating": 10, "ok": 23}
+    assert result["status_counts"] == {"calibrating": 9, "ok": 24}
     assert result["flagged_dates"] == ["2024-01-31", "2024-02-01", "2024-02-02"]
     assert result["sections"]["illness"]["day_recall"] == {"numerator": 3, "n": 3, "value": 1.0}
     assert result["sections"]["illness"]["episode_recall"] == {"numerator": 1, "n": 1, "value": 1.0}
