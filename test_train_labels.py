@@ -185,7 +185,7 @@ def test_training_uses_engine_noise_floor_and_exact_scores():
     feats = tr.extract_features(h, 30)
     assert abs(feats['rhr_z'] - 4.0) < 1e-9
     assert abs(feats['hrv_z'] - 5.0) < 1e-9
-    assert abs(feats['temp_z'] - 2.0) < 1e-9
+    assert abs(feats['temp_z'] - 1.0) < 1e-9
     assert feats['strain_idx'] == sr.assess_strain_result(h)['strain_index']
     assert feats['elevated_3d'] == 1
 

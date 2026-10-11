@@ -645,7 +645,7 @@ def test_structured_scores_include_zero_and_recovery_slope():
     assert result["metrics"]["temp"]["contribution"] == 0.0
     assert result["metrics"]["hrv"]["contribution"] > 0
     assert result["elevated_recent"] == 3
-    assert result["baseline_days"] == 20
+    assert result["baseline_days"] == 19
 
 
 def test_storage_preserves_nulls_and_audits_revisions(tmp_path, monkeypatch):
@@ -818,9 +818,9 @@ def test_baseline_builder_returns_exact_calendar_endpoints():
     history[5]["night_rhr"] = 999
     history[27]["night_rhr"] = 999
     baseline = sr.build_baseline(history)
-    assert baseline["rows"][0]["date"] == "2020-01-07"
+    assert baseline["rows"][0]["date"] == "2020-01-08"
     assert baseline["rows"][-1]["date"] == "2020-01-27"
-    assert baseline["baseline_days"] == 21
+    assert baseline["baseline_days"] == 20
     assert abs(baseline["metrics"]["rhr"]["mean"] - 60.0) < 1e-9
 
 
@@ -829,14 +829,16 @@ def test_calendar_baseline_does_not_reach_across_gaps():
     history = history[:30] + history[54:]
     result = sr.assess_strain_result(history)
     assert result["status"] == "calibrating"
-    assert result["baseline_days"] == 3
+    assert result["baseline_days"] == 4
 
 
-def test_calendar_guard_excludes_three_days_before_today():
+def test_calendar_guard_excludes_today_and_two_days_before():
     history = _dated_history(31)
-    history[-4]["temp_deviation"] = 0.1
-    result = sr.assess_strain_result(history)
-    assert abs(result["metrics"]["temp"]["z"]) < 1e-9
+    history[-3]["temp_deviation"] = 0.1
+    baseline_dates = [row["date"] for row in sr.build_baseline(history)["rows"]]
+    assert history[-3]["date"] not in baseline_dates
+    assert history[-4]["date"] in baseline_dates
+    assert abs(sr.assess_strain_result(history)["metrics"]["temp"]["z"]) < 1e-9
 
 
 def test_calendar_trajectory_does_not_reach_across_gaps():
@@ -875,15 +877,14 @@ def test_single_baseline_outlier_does_not_move_reference():
     history[20].update(night_rhr=200, avg_sleep_hrv=1, temp_deviation=5)
     history[-1]["temp_deviation"] = 0.1
     result = sr.assess_strain_result(history)
-    assert abs(result["metrics"]["temp"]["z"] - 2.0) < 1e-9
+    assert abs(result["metrics"]["temp"]["z"] - 1.0) < 1e-9
 
 
-def test_single_opposite_baseline_outlier_does_not_move_reference():
+def test_healthy_direction_excursion_stays_in_baseline():
     history = _dated_history(31)
     history[20].update(night_rhr=20, avg_sleep_hrv=200, temp_deviation=-5)
-    history[-1]["temp_deviation"] = 0.1
-    result = sr.assess_strain_result(history)
-    assert abs(result["metrics"]["temp"]["z"] - 2.0) < 1e-9
+    baseline_dates = [row["date"] for row in sr.build_baseline(history)["rows"]]
+    assert history[20]["date"] in baseline_dates
 
 
 def test_last_30_rows_match_full_history():

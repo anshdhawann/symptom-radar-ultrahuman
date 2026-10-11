@@ -271,7 +271,8 @@ def get_recent(conn, days=30):
     return [dict(zip(cols, r)) for r in rows]
 
 # ─── Strain Detection ─────────────────────────────────────────────────────────
-# Exclude today and the preceding CLEAN_GUARD calendar days from the baseline.
+# The baseline ends CLEAN_GUARD calendar days before today: today and the two
+# days before it are the candidate-sick window and never enter the reference.
 CLEAN_GUARD = 3
 BASELINE_WINDOW = 21
 TRAJ_WINDOW = 5      # days for slope / trajectory (includes today)
@@ -425,7 +426,12 @@ STRAIN_METRICS = [
 # the metric silently skipped (noise==0 → continue) exactly when a real
 # spike arrives. Floors keep the metric alive; they sit below real
 # physiological variability so they never change live scoring.
-MIN_NOISE = {"rhr": 1.0, "hrv": 1.0, "temp": 0.05}
+MIN_NOISE = {"rhr": 1.0, "hrv": 1.0, "temp": 0.10}
+
+# A baseline day whose weighted strain-direction deviation from the window's
+# robust reference reaches this score (Significant-grade on the strain index
+# scale) is treated as illness and kept out of the reference.
+ILLNESS_EXCLUSION_SCORE = 3.0
 
 def _calendar_rows(history):
     """Give legacy undated numerical inputs daily spacing."""
@@ -446,30 +452,37 @@ def _calendar_window(history, first_age, last_age):
 
 
 def build_baseline(history):
-    """Label-blind two-pass baseline for the last dated snapshot.
+    """Label-blind, non-recursive clean baseline for the last dated snapshot.
 
-    Exclude a day when any core metric is over three median/MAD noise units
-    from its reference, including strain and opposite-direction excursions.
-    Recompute weighted statistics on retained days.
-    A majority sustained shift moves the robust reference to the new normal.
+    The window is the BASELINE_WINDOW calendar days ending CLEAN_GUARD days
+    before today (D-23 to D-3 with the defaults). A day is dropped when its
+    weighted strain-direction deviation from the window's median/MAD reference
+    reaches ILLNESS_EXCLUSION_SCORE, the same scale as the strain index. That
+    keeps a prolonged illness out of its own reference (TemPredict dropped
+    febrile baseline days) until it fills about half the window, after which
+    a sustained shift becomes the new normal. Ordinary variability, and
+    excursions in the healthy direction, stay in so the noise estimate is not
+    trimmed.
     """
     history = _calendar_rows(history)
-    pool = _calendar_window(history, CLEAN_GUARD + 1, CLEAN_GUARD + BASELINE_WINDOW)
-    references = {}
-    for key, extract, _weight, _inverted, _label in STRAIN_METRICS:
+    pool = _calendar_window(history, CLEAN_GUARD, CLEAN_GUARD + BASELINE_WINDOW - 1)
+    references = []
+    for _key, extract, weight, inverted, _label in STRAIN_METRICS:
         series = [extract(day) for day in pool]
         if sum(value is not None for value in series) >= 7:
-            references[key] = (_median(series), max(
-                1.4826 * median_abs_deviation(series), MIN_NOISE[key]), extract)
-    def contaminated(day):
-        for median, noise, extract in references.values():
+            noise = max(1.4826 * median_abs_deviation(series), MIN_NOISE[_key])
+            references.append((_median(series), noise, extract, weight, inverted))
+
+    def illness_grade(day):
+        score = 0.0
+        for median, noise, extract, weight, inverted in references:
             value = extract(day)
             if value is not None:
                 deviation = (value - median) / noise
-                if abs(deviation) > 3.0:
-                    return True
-        return False
-    pool = [day for day in pool if not contaminated(day)]
+                score += weight * max(0.0, -deviation if inverted else deviation)
+        return score >= ILLNESS_EXCLUSION_SCORE
+
+    pool = [day for day in pool if not illness_grade(day)]
     dates = [day["date"] for day in pool]
     today = history[-1]["date"] if history else None
     metrics = {}
@@ -524,8 +537,8 @@ def assess_strain_result(history):
     5 signal streams including respiratory rate). It adapts the parts that
     don't depend on RR:
 
-    1. CLEAN BASELINE: days D-24 through D-4, with robust outlier exclusion
-       before weighted statistics. No labels or recursive scoring.
+    1. CLEAN BASELINE: calendar days D-23 through D-3, minus illness-grade
+       days, before weighted statistics. No labels or recursive scoring.
 
     2. TRAJECTORY — uses 5-day least-squares slope (rate of rise), not just
        today's level. Rate-of-rise is the real illness signature; a flat
@@ -605,16 +618,13 @@ def assess_strain_result(history):
         gate_ref = _median([mb["extract"](d) for d in baseline_pool])
         if gate_ref is None:
             gate_ref = mean
-        strain_series = [None if value is None else max(
-            0.0, gate_ref - value if inverted else value - gate_ref)
-            for value in recent_series]
-        slope = linear_slope(strain_series, [d["date"] for d in recent])
+        slope = linear_slope(recent_series, [d["date"] for d in recent])
         if slope is not None:
             z_level_gate = (today_val - gate_ref) / noise
             z_level_gate_s = -z_level_gate if inverted else z_level_gate
             if z_level_gate_s > MIN_SLOPE_LEVEL:
                 z_slope = (slope * TRAJ_WINDOW) / noise
-                z_slope_s = max(0.0, z_slope)
+                z_slope_s = max(0.0, -z_slope if inverted else z_slope)
             else:
                 z_slope_s = 0.0  # rising back toward typical — not strain
         else:
