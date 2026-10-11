@@ -13,7 +13,7 @@ privacy-preserving alternative to commercial symptom-radar products.
 
 | Item | Evidence |
 |---|---|
-| Strain engine: calendar-aligned clean baseline (the 21 days ending 3 days before today, median/MAD reference), illness-grade days kept out of their own baseline, trajectory boost, persistence, per-metric noise floors | `symptomradar/engine.py` and its tests |
+| Strain engine: calendar-aligned clean baseline (the 21 days ending 3 days before today; recency-weighted mean for the level, median and MAD for the illness screen and the trajectory gate), illness-grade days kept out of their own baseline, trajectory boost, persistence, per-metric noise floors | `symptomradar/engine.py` and its tests |
 | Honest non-scores: "No data", "Calibrating" and "Insufficient data" instead of a silent Normal | daily report and MCP JSON |
 | Re-fetches merge into stored days instead of blanking them; every real change is audited | `metric_revisions` table |
 | One definition of "today" (`SYMPTOM_RADAR_TZ`, default: the host's timezone) | `symptomradar/config.py` and its tests |

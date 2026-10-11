@@ -16,20 +16,20 @@ Four ideas, adapted from TemPredict's methodology:
 
 2. **Trajectory, not just level.** For each metric, a 5-day least-squares slope over calendar days captures the *rate of rise*. It only boosts a metric that is already more than 0.5σ off its median in the strain direction, so recovering toward normal never counts as strain, and a flat shift to a new normal scores lower than an accelerating climb.
 
-3. **Per-metric noise scaling.** Each metric's deviation is measured against its own robust noise estimate (the larger of the weighted std and 1.4826 × MAD, with a floor per metric), so an erratically variable HRV doesn't dominate a stable temperature. Thresholds become personal.
+3. **Per-metric noise scaling.** Today's deviation from each metric's recency-weighted baseline mean (each day back counts 0.9 times the day after it) is measured against that metric's own robust noise estimate (the larger of the weighted std and 1.4826 × MAD, with a floor per metric), so an erratically variable HRV doesn't dominate a stable temperature. Thresholds become personal.
 
-4. **Persistence.** The highest level requires elevation on at least 2 of the last 3 calendar days. One noisy night stays at Elevated; a multi-day pattern is what triggers Significant. This is the single biggest false-positive reducer (it filters a hangover, a hard workout, one bad night of sleep).
+4. **Persistence.** The highest level requires elevation on at least 2 of the last 3 calendar days, where a day counts as elevated when its level-only score (no trajectory, no recovery) reaches 1.0. One noisy night stays at Elevated; a multi-day pattern is what triggers Significant. This is the single biggest false-positive reducer (it filters a hangover, a hard workout, one bad night of sleep).
 
 | Metric | Weight | Direction |
 |---|---|---|
 | Resting Heart Rate | 25% | Elevated = strain signal |
 | Sleep HRV | 30% | Depressed = recovery impairment |
 | Skin Temp Deviation | 45% | Elevated = fever/inflammation signal |
-| Recovery Index | up to +30% (modifier) | Depressed beyond −1σ boosts the score |
+| Recovery Index | modifier, at most +0.55 | Depressed or falling fast = strain signal |
 
 > **Why these three?** TemPredict found skin temperature gave the largest single accuracy lift and HRV was the most indispensable once all signals were in. RHR is the classic strain marker. The Ultrahuman API exposes other potentially useful signals, but `hr_drop` is documented and not populated (see [the gap](#respiratory-rate-the-gap)), and adding sleep score or SpO2 only tipped days that were already just under the threshold (see the ablation in [BENCHMARK.md](BENCHMARK.md#7-extra-signals-ablation-exploratory)).
 
-Weights are multipliers on each metric's noise-normalized, strain-direction deviation. The weighted aggregate is the **strain index** (not a raw σ). Levels:
+Weights are multipliers on each core metric's noise-normalized, strain-direction deviation. Recovery is a modifier on top: more than 1σ below baseline it adds 0.10 × the deficit in σ (at most 0.30), and a fall of more than 1σ over the last 3 days adds 0.08 × the fall in σ (at most 0.25), even before it drops below baseline. Recovery alone adds at most 0.55, so it can tip a borderline day but cannot raise a flag by itself. The total is the **strain index** (not a raw σ). Levels:
 
 - ✅ **Normal** (strain index < 1.0): biometrics within your personal range
 - 🟡 **Elevated** (≥ 1.0): notable deviation, worth watching today (the "Oura flag")
@@ -38,7 +38,7 @@ Weights are multipliers on each metric's noise-normalized, strain-direction devi
 When a day cannot be scored, the report says so instead of showing Normal:
 
 - ⚪ **No data**: the ring has not synced today
-- ⏳ **Calibrating**: fewer than 7 clean baseline days so far, or a baseline for only one of today's metrics
+- ⏳ **Calibrating**: fewer than 7 clean baseline days so far (so the first verdict comes on day 10 at the earliest), or a baseline for only one of today's metrics
 - ⚪ **Insufficient data**: too few core metrics today to call it Normal (a strong deviation on the metrics that are present still raises a flag)
 
 ## Respiratory rate: the gap
