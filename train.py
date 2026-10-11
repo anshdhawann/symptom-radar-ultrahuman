@@ -27,38 +27,21 @@ MIN_EPISODES = 5
 
 
 # ─── Feature extraction ───────────────────────────────────────────────────────
-def _baseline_stats_series(pool, extract):
-    base = [extract(d) for d in pool]
-    return sr._baseline_stats(base)
-
 def extract_features(history, today_idx, offline=False):
     """Return morning features, with next-day rebound only when offline=True."""
     today = history[today_idx]
-    baseline_end = today_idx - sr.CLEAN_GUARD
-    if baseline_end <= 0:
-        return None
-    baseline_pool = history[max(0, baseline_end - sr.BASELINE_WINDOW):baseline_end]
-    if len(baseline_pool) < 7:
+    result = sr.assess_strain_result(history[:today_idx + 1])
+    if result["status"] != "ok":
         return None
 
     feats = {}
-    for key, extract, _w, inverted, _lbl in sr.STRAIN_METRICS:
-        mean, noise = _baseline_stats_series(baseline_pool, extract)
-        val = extract(today)
-        if mean is None or noise is None or noise == 0 or val is None:
-            feats[key + "_z"] = 0.0
-            continue
-        z = (val - mean) / noise
-        feats[key + "_z"] = (-z if inverted else z)  # strain direction, + = strain
-
-    # Strain index + persistence from the engine's own scoring
-    level, detail = sr.assess_strain(history[:today_idx + 1])
-    import re
-    m_idx = re.search(r"Strain index: ([\d.]+)", detail)
-    m_el = re.search(r"Elevated in (\d)/3", detail)
-    feats["strain_idx"] = float(m_idx.group(1)) if m_idx else 0.0
-    feats["elevated_3d"] = int(m_el.group(1)) if m_el else 0
-    feats["rec_decline"] = 1.0 if "Recovery↓" in detail else 0.0
+    for key, _extract, _w, inverted, _lbl in sr.STRAIN_METRICS:
+        z = result["metrics"][key]["z"]
+        feats[key + "_z"] = 0.0 if z is None else -z if inverted else z
+    feats["strain_idx"] = result["strain_index"]
+    feats["elevated_3d"] = result["elevated_recent"]
+    recovery_slope = result["metrics"].get("recovery", {}).get("z_slope")
+    feats["rec_decline"] = float(recovery_slope is not None and recovery_slope > 1.0)
 
     # Sleep score as an additional discriminator (poor sleep accompanies
     # illness; recovered days tend to have higher sleep scores). Zero-padded
@@ -242,7 +225,7 @@ def status_report(history):
               f"{max(0, MIN_EPISODES - ec['rough'])} more rough episodes.")
         print(f"Not ready to train: need {max(0, MIN_SICK - eligible_y.count(1))} more "
               f"assessable sick + {max(0, MIN_ROUGH - eligible_y.count(0))} more assessable rough days.")
-        print("The nightly cron (21:00) is collecting these automatically.")
+        print("Collect labels manually: python3 symptom_radar.py --label fine|rough|sick")
     return ready, counts
 
 
@@ -280,7 +263,7 @@ def main():
           f"({sum(1 for v in y if v == 1)} sick, {sum(1 for v in y if v == 0)} rough)")
     if len(X) < 4 or (not args.force and (counts["sick"] < MIN_SICK or counts["rough"] < MIN_ROUGH)):
         print("Too few labels for a meaningful classifier. "
-              "Keep the nightly labels coming.")
+              "Keep collecting manual labels.")
         return
 
     episodes = label_episodes(sr.get_labels())

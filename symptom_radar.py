@@ -5,10 +5,11 @@ Symptom Radar for Ultrahuman Ring
 A TemPredict-inspired anomaly detection system that monitors your biometric
 data (RHR, HRV, skin temperature) and flags early signs of physiological strain.
 
-Uses a 21-day rolling z-score baseline — same approach as Oura's Symptom Radar.
+Uses a robust, calendar-aligned 21-day rolling z-score baseline.
 
 Requires: ULTRAHUMAN_TOKEN environment variable
 Optional: SYMPTOM_RADAR_DB path (defaults to ./ultrahuman.db)
+Optional: SYMPTOM_RADAR_TZ IANA timezone (defaults to host local time)
 
 Usage:
     export ULTRAHUMAN_TOKEN="your-api-token"
@@ -18,6 +19,7 @@ Usage:
 
 import json, os, sys, sqlite3, math, time, argparse
 from datetime import datetime, timedelta, timezone
+from zoneinfo import ZoneInfo
 import requests
 
 # ─── Configuration ────────────────────────────────────────────────────────────
@@ -45,6 +47,19 @@ BASE_URL = "https://partner.ultrahuman.com/api/v1/partner/daily_metrics"
 DB_PATH = os.environ.get("SYMPTOM_RADAR_DB", os.path.join(os.path.dirname(os.path.abspath(__file__)), "ultrahuman.db"))
 
 # ─── Database ─────────────────────────────────────────────────────────────────
+def wearer_now():
+    """Current time in SYMPTOM_RADAR_TZ, or the host local timezone."""
+    name = os.environ.get("SYMPTOM_RADAR_TZ")
+    return datetime.now(ZoneInfo(name)) if name else datetime.now().astimezone()
+
+
+def wearer_midnight(day):
+    """Convert a wearer calendar date to midnight, preserving DST boundaries."""
+    midnight = datetime.combine(day, datetime.min.time())
+    name = os.environ.get("SYMPTOM_RADAR_TZ")
+    return midnight.replace(tzinfo=ZoneInfo(name)) if name else midnight.astimezone()
+
+
 def init_db():
     conn = sqlite3.connect(DB_PATH)
     conn.execute("""
@@ -256,14 +271,10 @@ def get_recent(conn, days=30):
     return [dict(zip(cols, r)) for r in rows]
 
 # ─── Strain Detection ─────────────────────────────────────────────────────────
-# Clean-baseline constants. The last CLEAN_GUARD days are treated as
-# candidate-sick and excluded from the baseline so an ongoing illness doesn't
-# inflate the mean/std and suppress today's score. TemPredict excluded febrile
-# baseline days; we exclude the recent window proactively.
+# Exclude today and the preceding CLEAN_GUARD calendar days from the baseline.
 CLEAN_GUARD = 3
 BASELINE_WINDOW = 21
 TRAJ_WINDOW = 5      # days for slope / trajectory (includes today)
-MIN_HISTORY = 11     # CLEAN_GUARD + 7 (min for rolling_stats_weighted) + 1
 MIN_SLOPE_LEVEL = 0.5  # slope trend only boosts when level is already ≥0.5σ
 
 def compute_zscore(val, mean, std):
@@ -271,7 +282,7 @@ def compute_zscore(val, mean, std):
         return None
     return (val - mean) / std
 
-def rolling_stats_weighted(series, decay=0.90):
+def rolling_stats_weighted(series, decay=0.90, dates=None, today=None):
     """
     Compute weighted mean and std with exponential decay.
     More recent values get higher weight.
@@ -281,12 +292,17 @@ def rolling_stats_weighted(series, decay=0.90):
     Std uses a Kish effective-sample-size correction (1 / (1 - sum(w^2)/W^2))
     so that weighting down older days doesn't systematically underestimate σ.
     """
-    valid = [s for s in series if s is not None]
-    if len(valid) < 7:
+    points = [(i, value) for i, value in enumerate(series) if value is not None]
+    if len(points) < 7:
         return None, None
-
-    n = len(valid)
-    weights = [decay ** (n - 1 - i) for i in range(n)]
+    valid = [value for _, value in points]
+    if dates is not None:
+        anchor = datetime.strptime(today or dates[-1], "%Y-%m-%d").date()
+        ages = [(anchor - datetime.strptime(dates[i], "%Y-%m-%d").date()).days
+                for i, _ in points]
+    else:
+        ages = [len(series) - 1 - i for i, _ in points]
+    weights = [decay ** age for age in ages]
     total_w = sum(weights)
     norm_w = [w / total_w for w in weights]
 
@@ -384,9 +400,9 @@ def _robust_noise(std, mad):
     candidates = [c for c in [std, mad * 1.4826 if mad is not None else None] if c is not None]
     return max(candidates) if candidates else None
 
-def _baseline_stats(baseline_series):
+def _baseline_stats(baseline_series, dates=None, today=None):
     """Compute mean and robust noise estimate for one metric's clean baseline."""
-    mean, std = rolling_stats_weighted(baseline_series)
+    mean, std = rolling_stats_weighted(baseline_series, dates=dates, today=today)
     mad = median_abs_deviation(baseline_series)
     noise = _robust_noise(std, mad)
     return mean, noise
@@ -411,6 +427,65 @@ STRAIN_METRICS = [
 # physiological variability so they never change live scoring.
 MIN_NOISE = {"rhr": 1.0, "hrv": 1.0, "temp": 0.05}
 
+def _calendar_rows(history):
+    """Give legacy undated numerical inputs daily spacing."""
+    if history and not any(day.get("date") for day in history):
+        start = datetime(2000, 1, 1).date()
+        return [{**day, "date": (start + timedelta(days=i)).isoformat()}
+                for i, day in enumerate(history)]
+    return history
+
+
+def _calendar_window(history, first_age, last_age):
+    if not history:
+        return []
+    today = datetime.strptime(history[-1]["date"], "%Y-%m-%d").date()
+    start = (today - timedelta(days=last_age)).isoformat()
+    end = (today - timedelta(days=first_age)).isoformat()
+    return [day for day in history if start <= day["date"] <= end]
+
+
+def build_baseline(history):
+    """Label-blind two-pass baseline for the last dated snapshot.
+
+    Exclude a day when any core metric is over three median/MAD noise units
+    from its reference, including strain and opposite-direction excursions.
+    Recompute weighted statistics on retained days.
+    A majority sustained shift moves the robust reference to the new normal.
+    """
+    history = _calendar_rows(history)
+    pool = _calendar_window(history, CLEAN_GUARD + 1, CLEAN_GUARD + BASELINE_WINDOW)
+    references = {}
+    for key, extract, _weight, _inverted, _label in STRAIN_METRICS:
+        series = [extract(day) for day in pool]
+        if sum(value is not None for value in series) >= 7:
+            references[key] = (_median(series), max(
+                1.4826 * median_abs_deviation(series), MIN_NOISE[key]), extract)
+    def contaminated(day):
+        for median, noise, extract in references.values():
+            value = extract(day)
+            if value is not None:
+                deviation = (value - median) / noise
+                if abs(deviation) > 3.0:
+                    return True
+        return False
+    pool = [day for day in pool if not contaminated(day)]
+    dates = [day["date"] for day in pool]
+    today = history[-1]["date"] if history else None
+    metrics = {}
+    for key, extract, weight, inverted, _label in STRAIN_METRICS:
+        series = [extract(day) for day in pool]
+        mean, noise = _baseline_stats(series, dates, today)
+        if noise is not None:
+            noise = max(noise, MIN_NOISE[key])
+        metrics[key] = {"mean": mean, "noise": noise, "weight": weight,
+                        "inverted": inverted, "extract": extract}
+    baseline_days = sum(
+        sum(extract(day) is not None for _, extract, *_ in STRAIN_METRICS) >= 2
+        for day in pool)
+    return {"rows": pool, "metrics": metrics, "baseline_days": baseline_days}
+
+
 def _day_level_score(day, metric_baselines):
     """Quick level-only strain score for a single day (used for the
     persistence check). Uses the same noise-normalized z as the main scorer
@@ -433,7 +508,7 @@ def _day_level_score(day, metric_baselines):
     return total
 
 def assess_strain(history):
-    """Legacy tuple adapter for evaluate.py and train.py. Unknown is unflagged.
+    """Legacy tuple adapter for retrospective callers. Unknown is unflagged.
 
     Use assess_strain_result for status-aware decisions.
     """
@@ -449,11 +524,8 @@ def assess_strain_result(history):
     5 signal streams including respiratory rate). It adapts the parts that
     don't depend on RR:
 
-    1. CLEAN BASELINE — excludes the last 3 days (candidate-sick window) so
-       an ongoing illness doesn't contaminate the mean/std. This is the #1
-       reason the old detector reacted late: the baseline included the
-       sickness itself. TemPredict excluded febrile (>38°C) baseline days;
-       we exclude the recent guard proactively.
+    1. CLEAN BASELINE: days D-24 through D-4, with robust outlier exclusion
+       before weighted statistics. No labels or recursive scoring.
 
     2. TRAJECTORY — uses 5-day least-squares slope (rate of rise), not just
        today's level. Rate-of-rise is the real illness signature; a flat
@@ -473,13 +545,12 @@ def assess_strain_result(history):
     Status is one of ok, no_data, calibrating, or insufficient_data.
     Normal requires two assessable core metrics. Partial elevation is retained.
     """
+    history = _calendar_rows(history)
     today = history[-1] if history else {}
     coverage = [key for key, extract, *_ in STRAIN_METRICS if extract(today) is not None]
-    baseline_pool = history[:-CLEAN_GUARD] if len(history) > CLEAN_GUARD else []
-    baseline_pool = baseline_pool[-BASELINE_WINDOW:]
-    baseline_days = sum(
-        sum(extract(day) is not None for _, extract, *_ in STRAIN_METRICS) >= 2
-        for day in baseline_pool)
+    baseline = build_baseline(history)
+    baseline_pool = baseline["rows"]
+    baseline_days = baseline["baseline_days"]
     result = {"status": "no_data", "level": None, "strain_index": None,
               "elevated_recent": None,
               "metrics": {key: {"z": None, "z_slope": None, "contribution": None}
@@ -487,22 +558,12 @@ def assess_strain_result(history):
               "baseline_days": baseline_days, "detail": "No core metrics for today"}
     if not coverage:
         return result
-    if len(history) < MIN_HISTORY or baseline_days < 7:
-        result.update(status="calibrating", detail="Insufficient clean baseline days")
+    if baseline_days < 7:
+        result.update(status="calibrating",
+                      detail=f"{baseline_days} of 7 clean baseline days")
         return result
-    recent = history[-TRAJ_WINDOW:]
-
-    # ── Precompute baseline stats per metric (done once, reused for persistence) ──
-    metric_baselines = {}
-    for key, extract, weight, inverted, _label in STRAIN_METRICS:
-        base_series = [extract(d) for d in baseline_pool]
-        mean, noise = _baseline_stats(base_series)
-        if noise is not None:
-            noise = max(noise, MIN_NOISE.get(key, 0.0))
-        metric_baselines[key] = {
-            "mean": mean, "noise": noise, "weight": weight,
-            "inverted": inverted, "extract": extract,
-        }
+    recent = _calendar_window(history, 0, TRAJ_WINDOW - 1)
+    metric_baselines = baseline["metrics"]
 
     scores = {}
     contributions = []
@@ -541,16 +602,19 @@ def assess_strain_result(history):
         # median reference is essential: a single outlier (e.g. the -1.74°C
         # temp on 07-21) drags the mean to -0.30, making a normal +0.03 day
         # look +0.5σ elevated and letting the reversion slope through.
-        slope = linear_slope(recent_series, [d.get("date") for d in recent])
+        gate_ref = _median([mb["extract"](d) for d in baseline_pool])
+        if gate_ref is None:
+            gate_ref = mean
+        strain_series = [None if value is None else max(
+            0.0, gate_ref - value if inverted else value - gate_ref)
+            for value in recent_series]
+        slope = linear_slope(strain_series, [d["date"] for d in recent])
         if slope is not None:
-            gate_ref = _median([mb["extract"](d) for d in baseline_pool])
-            if gate_ref is None:
-                gate_ref = mean
             z_level_gate = (today_val - gate_ref) / noise
             z_level_gate_s = -z_level_gate if inverted else z_level_gate
             if z_level_gate_s > MIN_SLOPE_LEVEL:
                 z_slope = (slope * TRAJ_WINDOW) / noise
-                z_slope_s = max(0.0, -z_slope if inverted else z_slope)
+                z_slope_s = max(0.0, z_slope)
             else:
                 z_slope_s = 0.0  # rising back toward typical — not strain
         else:
@@ -573,7 +637,10 @@ def assess_strain_result(history):
     # 1-2 days (observed in the user's data before every strain episode), so
     # it's the closest thing we have to an early-warning signal without RR.
     rec_series = [d.get("recovery_index") for d in baseline_pool]
-    rec_mean, rec_noise = _baseline_stats(rec_series)
+    rec_mean, rec_noise = _baseline_stats(
+        rec_series, [d["date"] for d in baseline_pool], today["date"])
+    if rec_noise is not None:
+        rec_noise = max(rec_noise, 1.0)
     today_rec = today.get("recovery_index")
     metric_details["recovery"] = {"z": None, "z_slope": None, "contribution": None}
     if rec_mean is not None and rec_noise is not None and rec_noise > 0 and today_rec is not None:
@@ -589,8 +656,9 @@ def assess_strain_result(history):
         # whenever the decline is strong (>1σ cumulative over 3 days); the
         # 0.08 weight cap keeps it from dominating even when the level has
         # already crashed (it ADDS to the level signal rather than replacing).
-        recent_rec = [d.get("recovery_index") for d in history[-3:]]
-        rec_slope = linear_slope(recent_rec, [d.get("date") for d in history[-3:]])
+        recovery_rows = _calendar_window(history, 0, 2)
+        recent_rec = [d.get("recovery_index") for d in recovery_rows]
+        rec_slope = linear_slope(recent_rec, [d["date"] for d in recovery_rows])
         if rec_slope is not None and rec_slope < 0:
             z_rec_slope_s = -(rec_slope * 3) / rec_noise   # 3-day drop in σ, + = strain
             metric_details["recovery"]["z_slope"] = z_rec_slope_s
@@ -607,12 +675,7 @@ def assess_strain_result(history):
     # Calendar-aligned, not row-aligned: days missing entirely from the DB
     # would make the last 3 rows span more than 3 calendar days and distort
     # the persistence count.
-    try:
-        t_date = datetime.strptime(today.get("date") or "", "%Y-%m-%d").date()
-        cal_window = {(t_date - timedelta(days=i)).isoformat() for i in range(3)}
-        recent_rows = [d for d in history[-5:] if d.get("date") in cal_window]
-    except ValueError:
-        recent_rows = history[-3:]
+    recent_rows = _calendar_window(history, 0, 2)
     elevated_days = sum(
         1 for d in recent_rows
         if _day_level_score(d, metric_baselines) >= 1.0
@@ -630,6 +693,9 @@ def assess_strain_result(history):
     if level == 0 and len(assessable) < 2:
         status = "calibrating" if len(coverage) >= 2 else "insufficient_data"
         level = None
+        if status == "calibrating":
+            detail = (f"baseline available for {len(assessable)} of {len(coverage)} "
+                      "present core metrics; need 2")
     result.update(status=status, level=level, strain_index=strain_today,
                   elevated_recent=elevated_days, metrics=metric_details, detail=detail)
     return result
@@ -650,10 +716,7 @@ def fmt_minutes(val):
 def build_report():
     """Fetch, store, assess, and return the daily report string."""
     conn = init_db()
-    # LOCAL calendar date, not UTC: the nightly check-in runs at 21:00 local,
-    # which is already the next UTC day in North America — a UTC "today" would
-    # fetch an unpopulated date and file data under tomorrow.
-    today = datetime.now()
+    today = wearer_now()
     yesterday = today - timedelta(days=1)
     y_str = yesterday.strftime("%Y-%m-%d")
     t_str = today.strftime("%Y-%m-%d")
@@ -745,7 +808,7 @@ def build_report():
     elif assessment["status"] == "no_data":
         verdict = "⚪ No data: ring not synced"
     elif assessment["status"] == "calibrating":
-        verdict = f"⏳ Calibrating: {assessment['baseline_days']} of 7 clean baseline days"
+        verdict = f"⏳ Calibrating: {assessment['detail']}"
     else:
         verdict = f"⚪ Insufficient data: {len(assessment['coverage'])} of 3 core metrics"
     parts.append(f"**{verdict}**")
@@ -832,23 +895,23 @@ def build_report():
 def backfill(days=35):
     """Fetch historical data to seed the baseline database."""
     conn = init_db()
-    today = datetime.now(timezone.utc)
+    today = wearer_now().date()
     start = today - timedelta(days=days)
     end = today - timedelta(days=1)
     current = start
     total = 0
 
-    print(f"Backfilling {days} days ({start.date()} to {end.date()})...")
+    print(f"Backfilling {days} days ({start} to {end})...")
 
     while current <= end:
         chunk_end = min(current + timedelta(days=6), end)
-        s_epoch = int(current.replace(tzinfo=timezone.utc).timestamp())
-        e_epoch = int((chunk_end + timedelta(days=1)).replace(tzinfo=timezone.utc).timestamp())
+        s_epoch = int(wearer_midnight(current).timestamp())
+        e_epoch = int(wearer_midnight(chunk_end + timedelta(days=1)).timestamp())
 
         try:
             data = fetch_range(s_epoch, e_epoch)
         except Exception as e:
-            print(f"  Error fetching {current.date()}–{chunk_end.date()}: {e}")
+            print(f"  Error fetching {current} to {chunk_end}: {e}")
             current = chunk_end + timedelta(days=1)
             time.sleep(2)
             continue
@@ -959,7 +1022,7 @@ def _mcp_handle(method, params):
                     "properties": {
                         "label": {"type": "string", "enum": ["fine", "rough", "sick"],
                                   "description": "fine=normal, rough=hangover/tired/stressed, sick=actually felt ill"},
-                        "date": {"type": "string", "description": "YYYY-MM-DD (defaults to today UTC)"},
+                        "date": {"type": "string", "description": "YYYY-MM-DD (defaults to today in the wearer timezone)"},
                         "note": {"type": "string", "description": "Optional context, e.g. 'hangover' or 'fever'"},
                     },
                     "required": ["label"],
@@ -1006,7 +1069,7 @@ def _mcp_handle(method, params):
             return {"content": [{"type": "text", "text": json.dumps(rows, indent=2)}]}, None
         if name == "symptom_radar_strain":
             conn = init_db()
-            today = datetime.now().strftime("%Y-%m-%d")
+            today = wearer_now().strftime("%Y-%m-%d")
             history = [day for day in get_recent(conn, 30) if day["date"] <= today]
             conn.close()
             if not history or history[-1]["date"] != today:
@@ -1016,7 +1079,7 @@ def _mcp_handle(method, params):
             return {"content": [{"type": "text", "text": json.dumps(result, indent=2)}]}, None
         if name == "symptom_radar_label":
             date_str = str(args.get("date") or
-                          datetime.now().strftime("%Y-%m-%d"))
+                          wearer_now().strftime("%Y-%m-%d"))
             label = str(args.get("label") or "")
             if label not in LABELS:
                 return None, f"label must be one of {LABELS}"
@@ -1096,7 +1159,7 @@ if __name__ == "__main__":
                              "(the training signal that lets the engine learn "
                              "your illness-vs-alcohol distinction)")
     parser.add_argument("--label-date", metavar="YYYY-MM-DD", default=None,
-                        help="Date for --label (defaults to today, UTC)")
+                        help="Date for --label (defaults to today in the wearer timezone)")
     parser.add_argument("--label-note", metavar="TEXT", default=None,
                         help="Optional note for --label (e.g. 'hangover', 'fever')")
     parser.add_argument("--labels", action="store_true",
@@ -1108,7 +1171,7 @@ if __name__ == "__main__":
     elif args.backfill:
         backfill(args.backfill)
     elif args.label:
-        date_str = args.label_date or datetime.now().strftime("%Y-%m-%d")
+        date_str = args.label_date or wearer_now().strftime("%Y-%m-%d")
         log_label(date_str, args.label, args.label_note)
         print(f"✅ Logged {date_str}: {args.label}"
               + (f" ({args.label_note})" if args.label_note else ""))
