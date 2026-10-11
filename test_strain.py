@@ -552,6 +552,235 @@ def test_morning_alertness_roundtrip():
         sr.DB_PATH = old
 
 
+def test_hrv_recovery_slope_does_not_boost_strain():
+    history = _flat_history()[:21]
+    for value in [0, 10, 20, 30, 40]:
+        history.append({**history[0], "avg_sleep_hrv": value})
+    level, detail = sr.assess_strain(history)
+    assert level == 0, detail
+    assert "HRV" in detail
+    assert "Strain index: 0.01" in detail
+
+
+def test_zero_median_temperature_recovery_is_normal():
+    history = _flat_history()[:15]
+    history += [{**history[0], "temp_deviation": v}
+                for v in [-1.74, -0.95, -0.40, 0.03, 0.03]]
+    level, detail = sr.assess_strain(history)
+    assert level == 0, detail
+
+
+def test_zero_night_rhr_is_not_replaced_by_sleep_rhr():
+    level, detail = sr.assess_strain(_flat_history(night_rhr=0, sleep_rhr=90))
+    assert level == 0, detail
+
+
+def _report_db(tmp_path, monkeypatch, history=None):
+    from datetime import datetime, timedelta
+    monkeypatch.setattr(sr, "DB_PATH", str(tmp_path / "report.db"))
+    conn = sr.init_db()
+    today = datetime.now().date()
+    for i, row in enumerate(history or []):
+        date = (today - timedelta(days=len(history) - i)).isoformat()
+        sr.store_snapshot(conn, date, row)
+    return conn, today.isoformat()
+
+
+def _mock_metrics(monkeypatch, metrics):
+    monkeypatch.setattr(sr, "fetch_day", lambda date: {
+        "data": {"metrics": {date: metrics}}})
+
+
+def test_report_zero_sleep_rhr_is_preserved(tmp_path, monkeypatch):
+    conn, date = _report_db(tmp_path, monkeypatch)
+    conn.close()
+    _mock_metrics(monkeypatch, [
+        {"type": "sleep_rhr", "object": {"value": 0}},
+        {"type": "night_rhr", "object": {"avg": 80}},
+    ])
+    assert "RHR: **0 bpm**" in sr.build_report()
+
+
+def test_assessment_unknown_states_and_coverage():
+    result = sr.assess_strain_result([])
+    assert result["status"] == "no_data"
+    assert result["level"] is None
+    result = sr.assess_strain_result(_flat_history()[:5])
+    assert result["status"] == "calibrating"
+    assert result["level"] is None
+    result = sr.assess_strain_result(_flat_history() + [{}])
+    assert result["status"] == "no_data"
+    assert result["coverage"] == []
+    assert result["strain_index"] is None
+    result = sr.assess_strain_result(_flat_history() + [{"night_rhr": 60}])
+    assert result["status"] == "insufficient_data"
+    assert result["level"] is None
+    assert result["coverage"] == ["rhr"]
+
+
+def test_assessment_partial_elevation_and_two_metric_normal():
+    result = sr.assess_strain_result(_flat_history() + [{"night_rhr": 80}])
+    assert result["status"] == "ok"
+    assert result["level"] == 1
+    result = sr.assess_strain_result(_flat_history() + [
+        {"night_rhr": 60, "temp_deviation": 0.0}])
+    assert result["status"] == "ok"
+    assert result["level"] == 0
+    assert result["coverage"] == ["rhr", "temp"]
+
+
+def test_sparse_baseline_is_calibrating():
+    result = sr.assess_strain_result([{}] * 20 + [_flat_history()[0]])
+    assert result["status"] == "calibrating"
+    assert result["baseline_days"] == 0
+    assert result["level"] is None
+
+
+def test_structured_scores_include_zero_and_recovery_slope():
+    history = _flat_history()[:21]
+    history += [{**history[0], "avg_sleep_hrv": v} for v in [0, 10, 20, 30, 40]]
+    result = sr.assess_strain_result(history)
+    assert result["metrics"]["hrv"]["z_slope"] == 0.0
+    assert result["metrics"]["temp"]["contribution"] == 0.0
+    assert result["metrics"]["hrv"]["contribution"] > 0
+    assert result["elevated_recent"] == 0
+    assert result["baseline_days"] == 21
+
+
+def test_storage_preserves_nulls_and_audits_revisions(tmp_path, monkeypatch):
+    conn, date = _report_db(tmp_path, monkeypatch)
+    sr.store_snapshot(conn, date, {"night_rhr": 60, "avg_sleep_hrv": 50,
+                                   "temp_deviation": 0.0, "sleep_score": 80})
+    sr.store_snapshot(conn, date, {})
+    sr.store_snapshot(conn, date, {"night_rhr": None, "avg_sleep_hrv": 45})
+    row = conn.execute("SELECT night_rhr, avg_sleep_hrv, temp_deviation, sleep_score "
+                       "FROM daily_snapshots WHERE date=?", (date,)).fetchone()
+    assert row == (60.0, 45.0, 0.0, 80.0)
+    revisions = conn.execute("SELECT date, field, old_value, new_value, fetched_at "
+                             "FROM metric_revisions").fetchall()
+    assert [r[:4] for r in revisions] == [(date, "avg_sleep_hrv", 50.0, 45.0)]
+    assert revisions[0][4]
+    sr.store_snapshot(conn, date, {"avg_sleep_hrv": 45})
+    sr.store_snapshot(conn, date, {"temp_deviation": 0.1})
+    conn.close()
+    conn = sr.init_db()
+    assert conn.execute("SELECT COUNT(*) FROM metric_revisions").fetchone() == (2,)
+    conn.close()
+
+
+def test_invalid_and_empty_new_snapshots_are_not_stored(tmp_path, monkeypatch):
+    conn, date = _report_db(tmp_path, monkeypatch)
+    sr.store_snapshot(conn, date, {})
+    sr.store_snapshot(conn, date, {"night_rhr": float("nan"),
+                                  "temp_deviation": "invalid", "sleep_score": float("inf")})
+    assert conn.execute("SELECT COUNT(*) FROM daily_snapshots").fetchone() == (0,)
+    conn.close()
+
+
+def test_empty_fetch_preserves_existing_row_without_normal_report(tmp_path, monkeypatch):
+    conn, date = _report_db(tmp_path, monkeypatch, _flat_history())
+    sr.store_snapshot(conn, date, _flat_history()[0])
+    conn.close()
+    _mock_metrics(monkeypatch, [])
+    report = sr.build_report()
+    assert "⚪ No data: ring not synced" in report
+    assert "✅ Normal" not in report
+    assert "Biometrics within normal range" not in report
+    conn = sr.init_db()
+    assert conn.execute("SELECT night_rhr, avg_sleep_hrv, temp_deviation "
+                        "FROM daily_snapshots WHERE date=?", (date,)).fetchone() == (60.0, 50.0, 0.0)
+    conn.close()
+
+
+def test_calibrating_report_has_no_cron_marker(tmp_path, monkeypatch):
+    conn, date = _report_db(tmp_path, monkeypatch)
+    conn.close()
+    _mock_metrics(monkeypatch, [
+        {"type": "night_rhr", "object": {"avg": 60}},
+        {"type": "avg_sleep_hrv", "object": {"value": 50}},
+    ])
+    report = sr.build_report()
+    assert "⏳ Calibrating: 0 of 7 clean baseline days" in report
+    assert "Biometrics within normal range" not in report
+    assert all(marker not in report for marker in ["✅ Normal", "🟡 Elevated", "🔴 Significant strain"])
+
+
+def test_mcp_strain_returns_structured_json(tmp_path, monkeypatch):
+    import json
+    conn, date = _report_db(tmp_path, monkeypatch, _flat_history())
+    sr.store_snapshot(conn, date, _flat_history()[0])
+    conn.close()
+    response, error = sr._mcp_handle("tools/call", {"name": "symptom_radar_strain"})
+    assert error is None
+    result = json.loads(response["content"][0]["text"])
+    assert result["status"] == "ok"
+    assert result["level"] == 0
+    assert result["strain_index"] < 1.0
+    assert result["coverage"] == ["rhr", "hrv", "temp"]
+    assert result["metrics"]["temp"]["contribution"] == 0.0
+
+
+def test_mcp_without_current_day_does_not_reuse_yesterday(tmp_path, monkeypatch):
+    import json
+    conn, date = _report_db(tmp_path, monkeypatch, _flat_history())
+    conn.close()
+    response, error = sr._mcp_handle("tools/call", {"name": "symptom_radar_strain"})
+    assert error is None
+    result = json.loads(response["content"][0]["text"])
+    assert result["status"] == "no_data"
+    assert result["level"] is None
+
+
+def test_invalid_fetched_core_metrics_report_no_data(tmp_path, monkeypatch):
+    conn, date = _report_db(tmp_path, monkeypatch, _flat_history())
+    conn.close()
+    _mock_metrics(monkeypatch, [
+        {"type": "night_rhr", "object": {"avg": "invalid"}},
+        {"type": "avg_sleep_hrv", "object": {"value": float("inf")}},
+    ])
+    assert "⚪ No data: ring not synced" in sr.build_report()
+
+
+def test_empty_today_fetch_does_not_store_yesterday_steps(tmp_path, monkeypatch):
+    conn, date = _report_db(tmp_path, monkeypatch, _flat_history())
+    sr.store_snapshot(conn, date, {**_flat_history()[0], "total_steps": 123})
+    conn.close()
+    monkeypatch.setattr(sr, "fetch_day", lambda requested: {
+        "data": {"metrics": {requested: [] if requested == date else [
+            {"type": "steps", "object": {"values": [{"value": 999}]}}]}}})
+    report = sr.build_report()
+    assert "⚪ No data: ring not synced" in report
+    conn = sr.init_db()
+    assert conn.execute("SELECT total_steps FROM daily_snapshots WHERE date=?",
+                        (date,)).fetchone() == (123.0,)
+    assert conn.execute("SELECT COUNT(*) FROM metric_revisions").fetchone() == (0,)
+    conn.close()
+
+
+def test_structured_recovery_contribution_matches_total():
+    history = _flat_history()[:18]
+    for i, row in enumerate(history):
+        row["recovery_index"] = 70 + [-1, 0, 1][i % 3]
+    history += [{**history[0], "recovery_index": value} for value in [60, 50, 40]]
+    result = sr.assess_strain_result(history)
+    assert result["metrics"]["recovery"]["contribution"] == 0.55
+    assert result["strain_index"] == 0.55
+
+
+def test_invalid_temperature_fetch_preserves_values_and_reports_no_data(tmp_path, monkeypatch):
+    conn, date = _report_db(tmp_path, monkeypatch, _flat_history())
+    sr.store_snapshot(conn, date, _flat_history()[0])
+    conn.close()
+    _mock_metrics(monkeypatch, [
+        {"type": "sleep", "object": {"temperature_deviation": {"celsius": "invalid"}}},
+    ])
+    assert "⚪ No data: ring not synced" in sr.build_report()
+    conn = sr.init_db()
+    assert conn.execute("SELECT temp_deviation FROM daily_snapshots WHERE date=?",
+                        (date,)).fetchone() == (0.0,)
+    conn.close()
+
+
 # ─── Tiny fallback runner (if pytest isn't installed) ───────────────────────
 def _collect():
     fns = [(n, getattr(sys.modules[__name__], n)) for n in dir(sys.modules[__name__])
