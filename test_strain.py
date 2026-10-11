@@ -552,6 +552,29 @@ def test_morning_alertness_roundtrip():
         sr.DB_PATH = old
 
 
+def test_hrv_recovery_slope_does_not_boost_strain():
+    history = _flat_history()[:21]
+    for value in [0, 10, 20, 30, 40]:
+        history.append({**history[0], "avg_sleep_hrv": value})
+    level, detail = sr.assess_strain(history)
+    assert level == 0, detail
+    assert "HRV" in detail
+    assert "Strain index: 0.01" in detail
+
+
+def test_zero_median_temperature_recovery_is_normal():
+    history = _flat_history()[:15]
+    history += [{**history[0], "temp_deviation": v}
+                for v in [-1.74, -0.95, -0.40, 0.03, 0.03]]
+    level, detail = sr.assess_strain(history)
+    assert level == 0, detail
+
+
+def test_zero_night_rhr_is_not_replaced_by_sleep_rhr():
+    level, detail = sr.assess_strain(_flat_history(night_rhr=0, sleep_rhr=90))
+    assert level == 0, detail
+
+
 # ─── Tiny fallback runner (if pytest isn't installed) ───────────────────────
 def _collect():
     fns = [(n, getattr(sys.modules[__name__], n)) for n in dir(sys.modules[__name__])
