@@ -5,7 +5,6 @@ import sys
 from datetime import date, timedelta
 from pathlib import Path
 
-os.environ.setdefault("ULTRAHUMAN_TOKEN", "dummy")
 from symptomradar import engine, storage
 import train as tr
 import labels

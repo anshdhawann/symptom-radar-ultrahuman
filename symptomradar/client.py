@@ -5,7 +5,7 @@ def fetch_day(date_str):
     resp = requests.get(
         config.BASE_URL,
         params={"date": date_str},
-        headers={"Authorization": config.TOKEN},
+        headers={"Authorization": config.require_token()},
         timeout=15
     )
     resp.raise_for_status()
@@ -15,7 +15,7 @@ def fetch_range(start_epoch, end_epoch):
     resp = requests.get(
         config.BASE_URL,
         params={"start_epoch": int(start_epoch), "end_epoch": int(end_epoch)},
-        headers={"Authorization": config.TOKEN},
+        headers={"Authorization": config.require_token()},
         timeout=15
     )
     resp.raise_for_status()

@@ -22,6 +22,12 @@ def main():
                         help="Print all logged self-report labels")
     args = parser.parse_args()
 
+    if not (args.mcp or args.labels or args.label or args.confounders is not None):
+        try:
+            config.require_token()
+        except config.MissingTokenError as exc:
+            parser.exit(1, f"{exc}\n")
+
     if args.mcp:
         mcp.run_mcp_server()
     elif args.backfill:

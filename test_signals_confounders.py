@@ -8,7 +8,6 @@ import sys
 
 import pytest
 
-os.environ.setdefault("ULTRAHUMAN_TOKEN", "dummy")
 from symptomradar import config, engine, mcp, storage
 import evaluate
 
@@ -221,6 +220,7 @@ def test_no_argument_report_markers_with_mocked_fetch(db, monkeypatch, capsys, r
             ]}}}
     monkeypatch.setenv("SYMPTOM_RADAR_DB", str(db))
     monkeypatch.setattr(sys, "argv", ["symptom_radar.py"])
+    monkeypatch.setenv("ULTRAHUMAN_TOKEN", "dummy")
     with patch("requests.get", return_value=Response()):
         runpy.run_path(str(__import__("pathlib").Path(__file__).with_name("symptom_radar.py")), run_name="__main__")
     output = capsys.readouterr().out
