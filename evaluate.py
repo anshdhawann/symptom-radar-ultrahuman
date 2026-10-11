@@ -27,7 +27,7 @@ def digest(value):
                                      allow_nan=False).encode()).hexdigest()
 
 
-def load_inputs(db_path, episodes_path=None):
+def load_inputs(db_path, episodes_path=None, include_confounders=False):
     """Read one SQLite transaction without creating tables or migrating."""
     with closing(sqlite3.connect(Path(db_path).resolve().as_uri() + "?mode=ro", uri=True)) as conn:
         conn.execute("BEGIN")
@@ -35,6 +35,9 @@ def load_inputs(db_path, episodes_path=None):
         history = [dict(row) for row in conn.execute("SELECT * FROM daily_snapshots ORDER BY date")]
         has_labels = conn.execute("SELECT 1 FROM sqlite_master WHERE type='table' AND name='daily_labels'").fetchone()
         labels = {row["date"]: row["label"] for row in conn.execute("SELECT date, label FROM daily_labels")} if has_labels else {}
+        has_confounders = conn.execute("SELECT 1 FROM sqlite_master WHERE type='table' AND name='daily_confounders'").fetchone()
+        confounders = {row["date"]: {key: row[key] for key in ("alcohol", "exercise", "travel", "sleep_loss")}
+                       for row in conn.execute("SELECT * FROM daily_confounders")} if has_confounders else {}
     annotations = {}
     if episodes_path is not None and Path(episodes_path).exists():
         annotations = json.loads(Path(episodes_path).read_text())
@@ -50,10 +53,12 @@ def load_inputs(db_path, episodes_path=None):
         "scored_columns": list(SCORED_COLUMNS),
         "sha256": digest([[row.get(key) for key in SCORED_COLUMNS] for row in history]),
         "labels_sha256": digest(labels),
+        "confounders_sha256": digest(confounders),
         "annotations_sha256": digest({"confirmed_sick": sorted(confirmed), "episodes": sorted(clusters)}),
         "annotations_present": bool(episodes_path is not None and Path(episodes_path).exists()),
     }
-    return history, labels, confirmed, clusters, fingerprint
+    inputs = (history, labels, confirmed, clusters, fingerprint)
+    return (*inputs, confounders) if include_confounders else inputs
 
 
 def score_all(history, scorer=None):
@@ -143,8 +148,29 @@ def analyze_separation(scores, labels, buffer):
     return groups
 
 
+def confounder_metrics(scores, confounders):
+    """Compare explicitly recorded exposure and absence, without causal claims."""
+    result = {}
+    for key in ("alcohol", "exercise", "travel", "sleep_loss"):
+        groups = {"with": [], "without": []}
+        unknown = unassessable = 0
+        for row in scores:
+            value = confounders.get(row["date"], {}).get(key)
+            if row["status"] != "ok":
+                unassessable += value is not None
+            elif value is None:
+                unknown += 1
+            else:
+                groups["with" if value > 0 else "without"].append(row)
+        result[key] = {name: rate(sum(row["level"] >= 1 for row in rows), len(rows))
+                       for name, rows in groups.items()}
+        result[key].update(unrecorded_assessable_days=unknown,
+                           unassessable_recorded_days=unassessable)
+    return result
+
+
 def evaluate_database(db_path, episodes_path=None, scorer=None):
-    history, labels, confirmed, clusters, fingerprint = load_inputs(db_path, episodes_path)
+    history, labels, confirmed, clusters, fingerprint, confounders = load_inputs(db_path, episodes_path, include_confounders=True)
     scores = score_all(history, scorer)
     illness = confirmed | {d for d, label in labels.items() if label == "sick"}
     strain = {d for d, label in labels.items() if label in ("rough", "sick")}
@@ -170,6 +196,7 @@ def evaluate_database(db_path, episodes_path=None, scorer=None):
         "flagged_dates": [r["date"] for r in scores if r["status"] == "ok" and r["level"] >= 1],
         "sections": {key: section_metrics(scores, labels, positive, meaning)
                      for key, (positive, meaning) in definitions.items()},
+        "confounders": confounder_metrics(scores, confounders),
         "label_separation": analyze_separation(scores, labels, buffer),
         "scores": scores,
     }
@@ -196,6 +223,10 @@ def print_summary(result, labels_only=False):
             print(f"{label}: n={group['n']}; flag rate {format_rate(group['flag_rate'])}; "
                   f"strain mean={group['strain_index_mean']}; range={group['strain_index_range']}")
         return
+    print("\nCONFOUNDERS (descriptive, assessable days, explicit absence only; not causal)")
+    for key, group in result["confounders"].items():
+        print(f"{key}: with {format_rate(group['with'])}; without {format_rate(group['without'])}; "
+              f"unrecorded={group['unrecorded_assessable_days']}; unassessable recorded={group['unassessable_recorded_days']}")
     for key, section in result["sections"].items():
         print(f"\n{key.upper()}: {section['interpretation']}")
         print(f"Eligible days: {section['eligible_days']}; buffer exclusions: {section['buffer_days']}")
