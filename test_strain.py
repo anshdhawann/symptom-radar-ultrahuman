@@ -781,6 +781,163 @@ def test_invalid_temperature_fetch_preserves_values_and_reports_no_data(tmp_path
     conn.close()
 
 
+def _dated_history(n=80, shift_at=None):
+    from datetime import date, timedelta
+    rows = []
+    for i in range(n):
+        shifted = shift_at is not None and i >= shift_at
+        rows.append({"date": (date(2020, 1, 1) + timedelta(days=i)).isoformat(),
+                     "night_rhr": 75 if shifted else 60,
+                     "avg_sleep_hrv": 30 if shifted else 50,
+                     "temp_deviation": 0.8 if shifted else 0.0,
+                     "recovery_index": 40 if shifted else 70})
+    return rows
+
+
+def test_calendar_baseline_does_not_reach_across_gaps():
+    history = _dated_history(61)
+    history = history[:30] + history[54:]
+    result = sr.assess_strain_result(history)
+    assert result["status"] == "calibrating"
+    assert result["baseline_days"] == 3
+
+
+def test_calendar_guard_excludes_three_days_before_today():
+    history = _dated_history(31)
+    history[-4]["temp_deviation"] = 0.1
+    result = sr.assess_strain_result(history)
+    assert abs(result["metrics"]["temp"]["z"]) < 1e-9
+
+
+def test_calendar_trajectory_does_not_reach_across_gaps():
+    history = _dated_history(61)
+    for row in history[56:]:
+        row["night_rhr"] = 70
+    history[49]["night_rhr"] = 50
+    history[50]["night_rhr"] = 55
+    history[51]["night_rhr"] = 60
+    history = history[:52] + history[59:]
+    result = sr.assess_strain_result(history)
+    assert result["metrics"]["rhr"]["z_slope"] == 0.0
+
+
+def test_weighted_stats_preserve_missing_calendar_days():
+    import pytest
+    mean, _ = sr.rolling_stats_weighted([0.0] * 7 + [None] * 10 + [10.0])
+    assert mean == pytest.approx(3.791958579196243)
+
+
+def test_synthetic_illness_remains_flagged_first_ten_days():
+    history = _dated_history(80, shift_at=30)
+    levels = [sr.assess_strain_result(history[:i + 1])["level"] for i in range(30, 40)]
+    assert all(level is not None and level >= 1 for level in levels), levels
+
+
+def test_permanent_shift_becomes_normal_within_35_days():
+    history = _dated_history(80, shift_at=30)
+    result = sr.assess_strain_result(history[:65])
+    assert result["status"] == "ok"
+    assert result["level"] == 0
+
+
+def test_single_baseline_outlier_does_not_move_reference():
+    history = _dated_history(31)
+    history[20].update(night_rhr=200, avg_sleep_hrv=1, temp_deviation=5)
+    history[-1]["temp_deviation"] = 0.1
+    result = sr.assess_strain_result(history)
+    assert abs(result["metrics"]["temp"]["z"] - 2.0) < 1e-9
+
+
+def test_last_30_rows_match_full_history():
+    history = _dated_history(80, shift_at=60)
+    full = sr.assess_strain_result(history)
+    recent = sr.assess_strain_result(history[-30:])
+    assert full["status"] == recent["status"] == "ok"
+    assert full["level"] == recent["level"] == 0
+    assert full["strain_index"] == recent["strain_index"]
+
+
+def _freeze_wearer_time(monkeypatch):
+    from datetime import datetime, timezone
+    class FrozenDateTime(datetime):
+        @classmethod
+        def now(cls, tz=None):
+            instant = cls(2020, 2, 1, 2, 0, tzinfo=timezone.utc)
+            return instant.astimezone(tz) if tz else instant.replace(tzinfo=None)
+    monkeypatch.setattr(sr, "datetime", FrozenDateTime)
+    monkeypatch.setenv("SYMPTOM_RADAR_TZ", "America/Edmonton")
+
+
+def test_wearer_timezone_report_mcp_and_label(tmp_path, monkeypatch):
+    import json
+    _freeze_wearer_time(monkeypatch)
+    monkeypatch.setattr(sr, "DB_PATH", str(tmp_path / "tz.db"))
+    conn = sr.init_db()
+    for row in _dated_history(31):
+        sr.store_snapshot(conn, row["date"], row)
+    conn.close()
+    requested = []
+    def fetch(day):
+        requested.append(day)
+        return {"data": {"metrics": {day: [
+            {"type": "night_rhr", "object": {"avg": 60}},
+            {"type": "avg_sleep_hrv", "object": {"value": 50}}]}}}
+    monkeypatch.setattr(sr, "fetch_day", fetch)
+    assert "✅ Normal" in sr.build_report()
+    assert requested == ["2020-01-30", "2020-01-31"]
+    response, error = sr._mcp_handle("tools/call", {"name": "symptom_radar_strain"})
+    assert error is None
+    assert json.loads(response["content"][0]["text"])["level"] == 0
+    response, error = sr._mcp_handle("tools/call", {
+        "name": "symptom_radar_label", "arguments": {"label": "fine"}})
+    assert error is None
+    assert json.loads(response["content"][0]["text"])["logged"] == "2020-01-31"
+    assert sr.get_labels() == [("2020-01-31", "fine", None)]
+
+
+def test_wearer_timezone_backfill_midnights(tmp_path, monkeypatch, capsys):
+    from datetime import datetime, timezone
+    _freeze_wearer_time(monkeypatch)
+    monkeypatch.setattr(sr, "DB_PATH", str(tmp_path / "tz.db"))
+    epochs = []
+    monkeypatch.setattr(sr, "fetch_range", lambda start, end: (
+        epochs.append((start, end)) or {"data": {"metrics": {}}}))
+    monkeypatch.setattr(sr.time, "sleep", lambda seconds: None)
+    assert sr.backfill(1) == 0
+    assert "2020-01-30 to 2020-01-30" in capsys.readouterr().out
+    assert [(datetime.fromtimestamp(a, timezone.utc).isoformat(),
+             datetime.fromtimestamp(b, timezone.utc).isoformat()) for a, b in epochs] == [
+        ("2020-01-30T07:00:00+00:00", "2020-01-31T07:00:00+00:00")]
+
+
+def test_wearer_timezone_cli_label_default(tmp_path, monkeypatch, capsys):
+    import runpy
+    from unittest.mock import patch
+    _freeze_wearer_time(monkeypatch)
+    monkeypatch.setenv("SYMPTOM_RADAR_DB", str(tmp_path / "cli-tz.db"))
+    monkeypatch.setattr(sys, "argv", ["symptom_radar.py", "--label", "fine"])
+    with patch("datetime.datetime", sr.datetime):
+        runpy.run_path(sr.__file__, run_name="__main__")
+    assert "✅ Logged 2020-01-31: fine" in capsys.readouterr().out
+    import sqlite3
+    with sqlite3.connect(tmp_path / "cli-tz.db") as conn:
+        assert conn.execute("SELECT date, label FROM daily_labels").fetchall() == [
+            ("2020-01-31", "fine")]
+
+
+def test_calibrating_metric_coverage_text_is_accurate(tmp_path, monkeypatch):
+    history = [{"night_rhr": 60, "avg_sleep_hrv": 50} for _ in range(30)]
+    conn, date = _report_db(tmp_path, monkeypatch, history)
+    conn.close()
+    _mock_metrics(monkeypatch, [
+        {"type": "night_rhr", "object": {"avg": 60}},
+        {"type": "sleep", "object": {"temperature_deviation": {"celsius": 0.0}}}])
+    report = sr.build_report()
+    assert "⏳ Calibrating: baseline available for 1 of 2 present core metrics; need 2" in report
+    assert "21 of 7" not in report
+    assert all(marker not in report for marker in sr.STRAIN_ICONS.values())
+
+
 # ─── Tiny fallback runner (if pytest isn't installed) ───────────────────────
 def _collect():
     fns = [(n, getattr(sys.modules[__name__], n)) for n in dir(sys.modules[__name__])

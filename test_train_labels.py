@@ -175,3 +175,46 @@ def test_review_excludes_actual_labels(tmp_path, monkeypatch, capsys):
     out = capsys.readouterr().out
     assert '2020-02-01' not in out
     assert '2020-02-02' in out
+
+
+def test_training_uses_engine_noise_floor_and_exact_scores():
+    h = history(31)
+    for row in h:
+        row.update(night_rhr=60, avg_sleep_hrv=50, temp_deviation=0.0)
+    h[-1].update(night_rhr=64, avg_sleep_hrv=45, temp_deviation=0.1)
+    feats = tr.extract_features(h, 30)
+    assert feats['rhr_z'] == 4.0
+    assert feats['hrv_z'] == 5.0
+    assert feats['temp_z'] == 2.0
+    assert feats['strain_idx'] == sr.assess_strain_result(h)['strain_index']
+    assert feats['elevated_3d'] == 1
+
+
+def test_training_does_not_parse_display_detail(monkeypatch):
+    h = history(31)
+    result = sr.assess_strain_result(h)
+    result.update(strain_index=1.23456789, elevated_recent=2, detail='not a machine interface')
+    result['metrics']['recovery'] = {'z': -2, 'z_slope': 1.5, 'contribution': 0.1}
+    monkeypatch.setattr(sr, 'assess_strain_result', lambda rows: result)
+    feats = tr.extract_features(h, 30)
+    assert feats['strain_idx'] == 1.23456789
+    assert feats['elevated_3d'] == 2
+    assert feats['rec_decline'] == 1.0
+
+
+def test_training_rejects_calendar_baseline_gap():
+    h = history(80)
+    h = h[:30] + h[75:]
+    assert tr.extract_features(h, len(h) - 1) is None
+
+
+def test_collection_status_explains_manual_labels(tmp_path, monkeypatch, capsys):
+    setup_db(tmp_path, monkeypatch)
+    tr.status_report(history())
+    out = capsys.readouterr().out
+    assert 'python3 symptom_radar.py --label fine|rough|sick' in out
+    assert 'collecting these automatically' not in out
+    labels.bulk_from_memory("don't remember")
+    out = capsys.readouterr().out
+    assert 'python3 symptom_radar.py --label fine|rough|sick' in out
+    assert 'cron' not in out
