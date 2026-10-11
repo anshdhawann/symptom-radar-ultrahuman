@@ -24,7 +24,7 @@ privacy-preserving alternative to commercial symptom-radar products.
 | Labelling | `--label` CLI, MCP tools, `labels.py`; manual only, the nightly check-in was retired in 2026-08 |
 | Sensitivity analysis | `scenario.py`; now reports that no hypothesis can be validated on current labels |
 | Package, console command, offline commands without a token | `symptomradar/` package, `pyproject.toml` (`symptom-radar` command); the root `symptom_radar.py` is a thin entry script |
-| Tests and CI | 172 tests, no network and no token; GitHub Actions on Python 3.10 to 3.14 |
+| Tests and CI | 173 tests, no network and no token; GitHub Actions on Python 3.10 to 3.14 |
 | MCP server error handling | standard JSON-RPC codes for bad input, server keeps serving; `test_mcp.py` |
 
 ## The measured verdict (details in BENCHMARK.md)

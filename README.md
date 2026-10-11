@@ -38,7 +38,7 @@ Weights are multipliers on each core metric's noise-normalized, strain-direction
 When a day cannot be scored, the report says so instead of showing Normal:
 
 - ⚪ **No data**: the ring has not synced today
-- ⏳ **Calibrating**: fewer than 7 clean baseline days so far (so the first verdict comes on day 10 at the earliest), or a baseline for only one of today's metrics
+- ⏳ **Calibrating**: fewer than 7 clean baseline days so far (so the first verdict comes on day 10 at the earliest), or usable baselines for fewer than two of today's metrics (each metric needs 7 clean days of its own; a strong deviation on a metric that has a baseline still raises a flag)
 - ⚪ **Insufficient data**: too few core metrics today to call it Normal (a strong deviation on the metrics that are present still raises a flag)
 
 ## Respiratory rate: the gap

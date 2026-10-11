@@ -977,6 +977,21 @@ def test_calibrating_metric_coverage_text_is_accurate(tmp_path, monkeypatch):
     assert all(marker not in report for marker in radar_report.STRAIN_ICONS.values())
 
 
+def test_calibrating_when_no_metric_has_seven_baseline_days():
+    # Seven clean baseline days with two core metrics each, but a different
+    # metric missing every day: no metric has 7 observations of its own.
+    from datetime import date, timedelta
+    keys = ["night_rhr", "avg_sleep_hrv", "temp_deviation"]
+    values = {"night_rhr": 60, "avg_sleep_hrv": 50, "temp_deviation": 0.0}
+    history = [{"date": (date(2020, 1, 1) + timedelta(days=i)).isoformat(),
+                **{k: v for k, v in values.items() if i >= 7 or k != keys[i % 3]}}
+               for i in range(10)]
+    result = engine.assess_strain_result(history)
+    assert result["baseline_days"] == 7
+    assert result["status"] == "calibrating" and result["level"] is None
+    assert result["detail"] == "baseline available for 0 of 3 present core metrics; need 2"
+
+
 # ─── Tiny fallback runner (if pytest isn't installed) ───────────────────────
 def _collect():
     fns = [(n, getattr(sys.modules[__name__], n)) for n in dir(sys.modules[__name__])
