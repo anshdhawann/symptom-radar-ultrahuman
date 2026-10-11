@@ -187,15 +187,15 @@ def test_slope_ignores_none():
     assert s > 0 and abs(s - 1.0) < 1e-6
 
 def test_slope_dates_prevent_gap_compression():
-    # Values rise 0.1 per CALENDAR day, but Jul 26 has no row at all.
+    # Values rise 0.1 per CALENDAR day, but Jan 3 has no row at all.
     # Index-based x compresses the 3-day span into 2 steps → slope 0.15;
     # calendar-dated x preserves the true rate of 0.10/day.
     vals = [0.1, 0.2, 0.4]
-    dates = ["2026-07-24", "2026-07-25", "2026-07-27"]
+    dates = ["2020-01-01", "2020-01-02", "2020-01-04"]
     assert abs(engine.linear_slope(vals) - 0.15) < 1e-9
     assert abs(engine.linear_slope(vals, dates) - 0.10) < 1e-9
     # Unparseable dates fall back to index spacing without raising.
-    assert abs(engine.linear_slope(vals, ["bad", None, "2026-07-27"]) - 0.15) < 1e-9
+    assert abs(engine.linear_slope(vals, ["bad", None, "2020-01-04"]) - 0.15) < 1e-9
 
 
 # ─── MAD / robust noise ───────────────────────────────────────────────────────
