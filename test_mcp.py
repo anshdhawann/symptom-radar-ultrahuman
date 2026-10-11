@@ -34,9 +34,9 @@ def serve(monkeypatch, bad):
     (request(name="symptom_radar_history", arguments=[]), -32602),
     (request(name="symptom_radar_history", arguments="bad"), -32602),
     (request(name="symptom_radar_history", arguments=None), -32602),
-    (request(name="unknown"), -32601), (request(method="unknown"), -32601),
+    (request(name="unknown"), -32602), (request(method="unknown"), -32601),
     *[(request(name="symptom_radar_history", arguments={"days": days}), -32602)
-      for days in ("3", 1.5, True, None, -1, 0, 10**100)],
+      for days in ("3", 1.5, True, None, -1, 0)],
     (request(name="symptom_radar_history", arguments={"metrics": "date"}), -32602),
     (request(name="symptom_radar_history", arguments={"metrics": [[]]}), -32602),
     (request(name="symptom_radar_label", arguments={"label": "invalid"}), -32602),
@@ -67,8 +67,9 @@ def test_mcp_notifications_are_silent(monkeypatch, notification):
     assert serve(monkeypatch, notification) == []
 
 
-@pytest.mark.parametrize("days", [1, 90])
+@pytest.mark.parametrize("days", [1, 90, 366, 367, 10**100])
 def test_mcp_valid_days_and_null_id(monkeypatch, tmp_path, days):
+    # Values above the 366-day cap are clamped, never an error or an overflow.
     monkeypatch.setattr(storage, "DB_PATH", str(tmp_path / "mcp.db"))
     req = request(name="symptom_radar_history", arguments={"days": days})
     req["id"] = None

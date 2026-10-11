@@ -1,6 +1,8 @@
 from . import config, engine, report, storage
 import json, sys
 
+MAX_HISTORY_DAYS = 366
+
 class RpcError(Exception):
     def __init__(self, code, message):
         super().__init__(message)
@@ -32,7 +34,8 @@ def _mcp_handle(method, params):
                 "inputSchema": {
                     "type": "object",
                     "properties": {
-                        "days": {"type": "integer", "default": 14, "minimum": 1, "maximum": 90},
+                        "days": {"type": "integer", "default": 14, "minimum": 1, "maximum": MAX_HISTORY_DAYS,
+                                 "description": f"Values above {MAX_HISTORY_DAYS} are capped to {MAX_HISTORY_DAYS}."},
                         "metrics": {
                             "type": "array",
                             "items": {"type": "string"},
@@ -85,8 +88,9 @@ def _mcp_handle(method, params):
             return {"content": [{"type": "text", "text": report.build_report()}]}, None
         if name == "symptom_radar_history":
             days = args.get("days", 14)
-            if type(days) is not int or not 1 <= days <= 90:
-                raise RpcError(-32602, "days must be an integer between 1 and 90")
+            if type(days) is not int or days < 1:
+                raise RpcError(-32602, "days must be a positive integer")
+            days = min(days, MAX_HISTORY_DAYS)
             if "metrics" in args and (not isinstance(args["metrics"], list)
                     or not all(isinstance(item, str) for item in args["metrics"])):
                 raise RpcError(-32602, "metrics must be an array of strings")
@@ -148,7 +152,8 @@ def _mcp_handle(method, params):
         if name == "symptom_radar_labels":
             return {"content": [{"type": "text",
                                  "text": json.dumps(storage.get_labels(), indent=2)}]}, None
-        raise RpcError(-32601, f"Unknown tool: {name}")
+        # MCP reports an unknown tool as invalid params: tools/call itself exists.
+        raise RpcError(-32602, f"Unknown tool: {name}")
 
     raise RpcError(-32601, f"Unknown method: {method}")
 
